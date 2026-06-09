@@ -11,6 +11,7 @@ from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import NeuronQwen
 from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl import NeuronQwen2VLForCausalLM
 from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl_vision import NeuronQwen2VLForImageEncoding
 from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import NeuronQwen3ForCausalLM
+from neuronx_distributed_inference.models.qwen3_5.modeling_qwen3_5 import NeuronQwen3_5ForCausalLM
 from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
 from neuronx_distributed_inference.models.qwen3_vl.modeling_qwen3_vl_vision import NeuronQwen3VLForImageEncoding
 from neuronx_distributed_inference.models.qwen3_vl.modeling_qwen3_vl import NeuronQwen3VLForCausalLM
@@ -62,6 +63,8 @@ MODEL_TYPES = {
                  "image-encoding": NeuronQwen2VLForImageEncoding},
     "qwen3": {"causal-lm": NeuronQwen3ForCausalLM},
     "qwen3_moe": {"causal-lm": NeuronQwen3MoeForCausalLM},
+    "qwen3_next": {"causal-lm": NeuronQwen3_5ForCausalLM},
+    "qwen3_5": {"causal-lm": NeuronQwen3_5ForCausalLM},
     "gemma3": {"causal-lm": NeuronGemma3ForCausalLM},
     "qwen3_vl": {"causal-lm": NeuronQwen3VLForCausalLM,
                  "image-encoding": NeuronQwen3VLForImageEncoding},
