@@ -1,0 +1,518 @@
+# coding=utf-8
+# Copyright 2026 Google Inc. HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Gemma 4 text model for NxD inference."""
+
+import copy
+from typing import List, Optional, Tuple, Type
+
+import torch
+from torch import nn
+
+from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
+from neuronx_distributed.utils import cpu_mode
+
+from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
+from neuronx_distributed_inference.models.gemma3.modeling_gemma3 import get_rmsnorm_cls as get_gemma3_rmsnorm_cls
+from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaMLP
+from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
+from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
+from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
+
+
+class NeuronGemma4RMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6, with_scale: bool = True):
+        super().__init__()
+        self.eps = eps
+        self.with_scale = with_scale
+        if with_scale:
+            self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.bfloat16))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        output = hidden_states.float()
+        output = output * torch.rsqrt(output.pow(2).mean(-1, keepdim=True) + self.eps)
+        if self.with_scale:
+            output = output * self.weight.float()
+        return output.type_as(hidden_states)
+
+
+class Gemma4LmHead(ColumnParallelLinear):
+    def __init__(self, *args, final_logit_softcapping=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.final_logit_softcapping = final_logit_softcapping
+
+    def forward(self, hidden_states):
+        logits = super().forward(hidden_states)
+        if self.final_logit_softcapping is None:
+            return logits
+        return torch.tanh(logits / self.final_logit_softcapping) * self.final_logit_softcapping
+
+
+def get_rmsnorm_cls(with_scale: bool = True):
+    if cpu_mode() and with_scale:
+        return get_gemma3_rmsnorm_cls()
+    return lambda hidden_size, eps: NeuronGemma4RMSNorm(hidden_size, eps=eps, with_scale=with_scale)
+
+
+def get_updated_configs(config: "Gemma4InferenceConfig"):
+    updated_configs = []
+    for layer_idx, layer_type in enumerate(config.layer_types):
+        updated_config = copy.deepcopy(config)
+        updated_config.layer_idx = layer_idx
+        updated_config.layer_type = layer_type
+        updated_config.is_full_attention = layer_type == "full_attention"
+        updated_config.sliding_window = config.sliding_window if layer_type == "sliding_attention" else None
+        updated_config.head_dim = config.global_head_dim if updated_config.is_full_attention else config.local_head_dim
+        updated_config.num_key_value_heads = (
+            config.num_global_key_value_heads
+            if updated_config.is_full_attention and config.num_global_key_value_heads is not None
+            else config.local_num_key_value_heads
+        )
+        first_kv_shared_layer_idx = config.num_hidden_layers - config.num_kv_shared_layers
+        updated_config.is_kv_shared_layer = config.num_kv_shared_layers > 0 and layer_idx >= first_kv_shared_layer_idx
+        updated_config.intermediate_size = config.intermediate_size * (
+            2 if config.use_double_wide_mlp and updated_config.is_kv_shared_layer else 1
+        )
+        updated_configs.append(updated_config)
+    return updated_configs
+
+
+class Gemma4NeuronConfig(NeuronConfig):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.attn_cls = NeuronGemma4Attention
+
+
+class Gemma4InferenceConfig(InferenceConfig):
+    def __init__(self, neuron_config: NeuronConfig, fused_spec_config=None, load_config=None):
+        self.attributes = [
+            "attention_bias",
+            "attention_k_eq_v",
+            "final_logit_softcapping",
+            "global_head_dim",
+            "head_dim",
+            "hidden_activation",
+            "hidden_size",
+            "hidden_size_per_layer_input",
+            "intermediate_size",
+            "layer_types",
+            "max_position_embeddings",
+            "num_attention_heads",
+            "num_global_key_value_heads",
+            "num_hidden_layers",
+            "num_key_value_heads",
+            "num_kv_shared_layers",
+            "rms_norm_eps",
+            "rope_parameters",
+            "sliding_window",
+            "tie_word_embeddings",
+            "use_double_wide_mlp",
+            "vocab_size",
+            "vocab_size_per_layer_input",
+        ]
+        self.neuron_config = neuron_config
+        self.fused_spec_config = fused_spec_config
+
+        if load_config is not None:
+            load_config(self)
+        else:
+            self.load_config()
+
+        source_config = self.text_config if hasattr(self, "text_config") else self
+        self.attention_bias = source_config.attention_bias if hasattr(source_config, "attention_bias") else False
+        self.attention_k_eq_v = source_config.attention_k_eq_v if hasattr(source_config, "attention_k_eq_v") else False
+        self.final_logit_softcapping = (
+            source_config.final_logit_softcapping if hasattr(source_config, "final_logit_softcapping") else None
+        )
+        self.local_head_dim = source_config.head_dim if hasattr(source_config, "head_dim") else 256
+        self.global_head_dim = source_config.global_head_dim if hasattr(source_config, "global_head_dim") else self.local_head_dim
+        self.head_dim = self.local_head_dim
+        self.hidden_activation = (
+            source_config.hidden_activation if hasattr(source_config, "hidden_activation") else "gelu_pytorch_tanh"
+        )
+        self.hidden_act = self.hidden_activation
+        self.hidden_size = source_config.hidden_size
+        self.hidden_size_per_layer_input = (
+            source_config.hidden_size_per_layer_input
+            if hasattr(source_config, "hidden_size_per_layer_input")
+            else 0
+        )
+        self.intermediate_size = source_config.intermediate_size
+        self.layer_types = source_config.layer_types if hasattr(source_config, "layer_types") else None
+        self.max_position_embeddings = source_config.max_position_embeddings
+        self.num_attention_heads = source_config.num_attention_heads
+        self.local_num_key_value_heads = source_config.num_key_value_heads
+        self.num_global_key_value_heads = (
+            source_config.num_global_key_value_heads if hasattr(source_config, "num_global_key_value_heads") else None
+        )
+        self.num_hidden_layers = source_config.num_hidden_layers
+        self.num_key_value_heads = self.local_num_key_value_heads
+        self.num_kv_shared_layers = (
+            source_config.num_kv_shared_layers if hasattr(source_config, "num_kv_shared_layers") else 0
+        )
+        self.rms_norm_eps = source_config.rms_norm_eps
+        self.rope_parameters = source_config.rope_parameters if hasattr(source_config, "rope_parameters") else None
+        self.sliding_window = source_config.sliding_window
+        self.tie_word_embeddings = (
+            source_config.tie_word_embeddings if hasattr(source_config, "tie_word_embeddings") else True
+        )
+        self.use_double_wide_mlp = (
+            source_config.use_double_wide_mlp if hasattr(source_config, "use_double_wide_mlp") else False
+        )
+        self.vocab_size = source_config.vocab_size
+        self.vocab_size_per_layer_input = (
+            source_config.vocab_size_per_layer_input
+            if hasattr(source_config, "vocab_size_per_layer_input")
+            else self.vocab_size
+        )
+        self.pad_token_id = source_config.pad_token_id if hasattr(source_config, "pad_token_id") else 0
+
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention" if bool((i + 1) % 5) else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
+        if self.layer_types[-1] != "full_attention":
+            self.layer_types[-1] = "full_attention"
+
+        self.add_derived_config()
+        self.validate_config()
+
+    def add_derived_config(self):
+        self.num_cores_per_group = 1
+
+    def get_required_attributes(self) -> List[str]:
+        return self.attributes
+
+    @classmethod
+    def get_neuron_config_cls(cls) -> Type[Gemma4NeuronConfig]:
+        return Gemma4NeuronConfig
+
+
+class NeuronGemma4Attention(NeuronAttentionBase):
+    def __init__(self, config: Gemma4InferenceConfig):
+        rope_parameters = config.rope_parameters[config.layer_type] if config.rope_parameters else None
+        rope_theta = rope_parameters["rope_theta"] if rope_parameters and "rope_theta" in rope_parameters else 10000.0
+        rotary_dim = config.head_dim
+        if rope_parameters and "partial_rotary_factor" in rope_parameters:
+            rotary_dim = int(config.head_dim * rope_parameters["partial_rotary_factor"])
+
+        rotary_emb = RotaryEmbedding(
+            dim=rotary_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=rope_theta,
+        )
+
+        super().__init__(
+            config=config,
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            rotary_emb=rotary_emb,
+            rms_norm_eps=config.rms_norm_eps,
+            use_qk_norm=False,
+            use_scaled_rope=None,
+            sliding_window=config.sliding_window,
+            softmax_scale=1.0,
+            q_layernorm=get_rmsnorm_cls()(config.head_dim, eps=config.rms_norm_eps),
+            k_layernorm=get_rmsnorm_cls()(config.head_dim, eps=config.rms_norm_eps),
+        )
+        self.v_layernorm = get_rmsnorm_cls(with_scale=False)(config.head_dim, eps=config.rms_norm_eps)
+
+    def prep_qkv_tensors(self, *args, **kwargs):
+        q, k, v, cos_cache, sin_cache, residual = super().prep_qkv_tensors(*args, **kwargs)
+        v = self.v_layernorm(v)
+        return q, k, v, cos_cache, sin_cache, residual
+
+
+class NeuronGemma4DecoderLayer(nn.Module):
+    def __init__(self, config: Gemma4InferenceConfig, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.attention_type = config.layer_type
+        self.is_sliding_window_attention = config.sliding_window is not None
+
+        self.self_attn = NeuronGemma4Attention(config)
+        self.mlp = NeuronLlamaMLP(config)
+        self.input_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_feedforward_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_feedforward_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
+
+        if config.hidden_size_per_layer_input and config.hidden_size_per_layer_input > 0:
+            self.per_layer_input_gate = ColumnParallelLinear(
+                config.hidden_size,
+                config.hidden_size_per_layer_input,
+                bias=False,
+                gather_output=True,
+                dtype=config.neuron_config.torch_dtype,
+            )
+            self.per_layer_projection = ColumnParallelLinear(
+                config.hidden_size_per_layer_input,
+                config.hidden_size,
+                bias=False,
+                gather_output=True,
+                dtype=config.neuron_config.torch_dtype,
+            )
+            self.post_per_layer_input_norm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.per_layer_input_gate = None
+            self.per_layer_projection = None
+            self.post_per_layer_input_norm = None
+
+        self.register_buffer("layer_scalar", torch.ones(1))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        local_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        adapter_ids=None,
+        per_layer_input: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        per_layer_inputs = kwargs.pop("per_layer_inputs", None)
+        if per_layer_input is None and per_layer_inputs is not None:
+            per_layer_input = per_layer_inputs[:, :, self.layer_idx, :]
+        mask = local_mask if self.is_sliding_window_attention and local_mask is not None else attention_mask
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm(residual)
+        hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            adapter_ids=adapter_ids,
+            **kwargs,
+        )
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = hidden_states + residual
+
+        residual = hidden_states
+        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)[0]
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = hidden_states + residual
+
+        if per_layer_input is not None and self.per_layer_input_gate is not None:
+            gate = self.per_layer_input_gate(hidden_states)
+            gate = torch.nn.functional.gelu(gate, approximate="tanh")
+            per_layer_contribution = self.per_layer_projection(gate * per_layer_input)
+            per_layer_contribution = self.post_per_layer_input_norm(per_layer_contribution)
+            hidden_states = hidden_states + per_layer_contribution
+
+        hidden_states = hidden_states * self.layer_scalar
+        return (hidden_states, present_key_value, cos_cache, sin_cache, None)
+
+
+class NeuronGemma4TextModel(NeuronBaseModel):
+    def setup_attr_for_model(self, config: Gemma4InferenceConfig):
+        self.on_device_sampling = config.neuron_config.on_device_sampling_config is not None
+        self.tp_degree = config.neuron_config.tp_degree
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.max_batch_size = config.neuron_config.max_batch_size
+        self.buckets = config.neuron_config.buckets
+        self.head_dim = config.global_head_dim
+        self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
+        self.vocab_size_per_layer_input = config.vocab_size_per_layer_input
+
+    def init_model(self, config: Gemma4InferenceConfig):
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.embed_tokens = ParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            self.padding_idx,
+            dtype=config.neuron_config.torch_dtype,
+            shard_across_embedding=True,
+            sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+        )
+        if config.hidden_size_per_layer_input and config.hidden_size_per_layer_input > 0:
+            self.embed_tokens_per_layer = ParallelEmbedding(
+                config.vocab_size_per_layer_input,
+                config.num_hidden_layers * config.hidden_size_per_layer_input,
+                self.padding_idx,
+                dtype=config.neuron_config.torch_dtype,
+                shard_across_embedding=True,
+                sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+            )
+            self.per_layer_model_projection = ColumnParallelLinear(
+                config.hidden_size,
+                config.num_hidden_layers * config.hidden_size_per_layer_input,
+                bias=False,
+                gather_output=True,
+                dtype=config.neuron_config.torch_dtype,
+            )
+            self.per_layer_projection_norm = get_rmsnorm_cls()(config.hidden_size_per_layer_input, eps=config.rms_norm_eps)
+            self.register_buffer("embed_scale_per_layer", torch.tensor(config.hidden_size_per_layer_input**0.5))
+            self.register_buffer("per_layer_input_scale", torch.rsqrt(torch.tensor(2.0)))
+            self.register_buffer("per_layer_projection_scale", torch.tensor(config.hidden_size**-0.5))
+        else:
+            self.embed_tokens_per_layer = None
+            self.per_layer_model_projection = None
+            self.per_layer_projection_norm = None
+
+        self.lm_head = Gemma4LmHead(
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+            pad=True,
+            gather_output=not self.on_device_sampling,
+            dtype=config.neuron_config.torch_dtype,
+            final_logit_softcapping=config.final_logit_softcapping,
+        )
+
+        updated_configs = get_updated_configs(config)
+        self.layers = nn.ModuleList(
+            [NeuronGemma4DecoderLayer(layer_config, idx) for idx, layer_config in enumerate(updated_configs)]
+        )
+        self.norm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
+        self.register_buffer("normalizer", torch.tensor(config.hidden_size**0.5, dtype=config.neuron_config.torch_dtype))
+
+    def get_per_layer_inputs(self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor):
+        if self.embed_tokens_per_layer is None:
+            return None
+        per_layer_inputs_mask = torch.logical_and(input_ids >= 0, input_ids < self.vocab_size_per_layer_input)
+        per_layer_input_ids = torch.where(per_layer_inputs_mask, input_ids, torch.zeros_like(input_ids))
+        per_layer_embeds = self.embed_tokens_per_layer(per_layer_input_ids) * self.embed_scale_per_layer
+        per_layer_embeds = per_layer_embeds.reshape(
+            *input_ids.shape,
+            self.config.num_hidden_layers,
+            self.hidden_size_per_layer_input,
+        )
+        per_layer_projection = self.per_layer_model_projection(inputs_embeds) * self.per_layer_projection_scale
+        per_layer_projection = per_layer_projection.reshape(
+            *inputs_embeds.shape[:-1],
+            self.config.num_hidden_layers,
+            self.hidden_size_per_layer_input,
+        )
+        per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
+        return (per_layer_projection + per_layer_embeds) * self.per_layer_input_scale
+
+    def get_model_output(self, input_ids: torch.LongTensor = None, inputs_embeds=None, **kwargs):
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        inputs_embeds = inputs_embeds * self.normalizer
+        per_layer_inputs = None if input_ids is None else self.get_per_layer_inputs(input_ids, inputs_embeds)
+        kwargs["inputs_embeds"] = inputs_embeds
+        kwargs["per_layer_inputs"] = per_layer_inputs
+        hidden_states = super().get_model_output(input_ids=input_ids, **kwargs)
+        return hidden_states
+
+
+class NeuronGemma4ForCausalLM(NeuronBaseForCausalLM):
+    _model_cls = NeuronGemma4TextModel
+    _STATE_DICT_MODEL_PREFIX = "language_model.model."
+
+    @staticmethod
+    def load_hf_model(model_path, **kwargs):
+        try:
+            from transformers import Gemma4ForCausalLM
+
+            return Gemma4ForCausalLM.from_pretrained(model_path, **kwargs)
+        except ImportError:
+            from transformers import Gemma4ForConditionalGeneration
+
+            return Gemma4ForConditionalGeneration.from_pretrained(model_path, **kwargs)
+
+    def enable_context_encoding(self):
+        self.compile_tag = CONTEXT_ENCODING_MODEL_TAG
+        super().enable_context_encoding()
+
+    def enable_token_generation(self):
+        self.compile_tag = TOKEN_GENERATION_MODEL_TAG
+        super().enable_token_generation()
+
+    def get_compiler_args(self):
+        optimization_level = "-O1"
+        compiler_args = f"--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer {optimization_level}"
+        compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
+        compiler_args += " --auto-cast=none"
+        compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
+        compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
+        return compiler_args
+
+    @staticmethod
+    def convert_hf_to_neuron_state_dict(state_dict: dict, config: InferenceConfig) -> dict:
+        if any(k.startswith("model.language_model.") for k in state_dict):
+            state_dict = {k.replace("model.language_model.", ""): v for k, v in state_dict.items()}
+        elif "model.norm.weight" in state_dict:
+            state_dict = {k.removeprefix("model."): v for k, v in state_dict.items()}
+
+        neuron_config = config.neuron_config
+        if neuron_config.vocab_parallel:
+            state_dict["embed_tokens.rank_util.rank"] = torch.arange(0, neuron_config.local_ranks_size)
+
+        first_kv_shared_layer_idx = config.num_hidden_layers - config.num_kv_shared_layers
+        kv_source_by_type = {}
+        for layer_idx, layer_type in enumerate(config.layer_types):
+            if layer_idx < first_kv_shared_layer_idx:
+                kv_source_by_type[layer_type] = layer_idx
+            elif layer_type in kv_source_by_type:
+                source_idx = kv_source_by_type[layer_type]
+                for proj_name in ("k_proj", "v_proj"):
+                    for attr in ("weight", "bias"):
+                        source_key = f"layers.{source_idx}.self_attn.{proj_name}.{attr}"
+                        target_key = f"layers.{layer_idx}.self_attn.{proj_name}.{attr}"
+                        if source_key in state_dict and target_key not in state_dict:
+                            state_dict[target_key] = state_dict[source_key].detach().clone()
+                for norm_name in ("k_norm",):
+                    source_key = f"layers.{source_idx}.self_attn.{norm_name}.weight"
+                    target_key = f"layers.{layer_idx}.self_attn.{norm_name}.weight"
+                    if source_key in state_dict and target_key not in state_dict:
+                        state_dict[target_key] = state_dict[source_key].detach().clone()
+
+        for layer_idx in range(config.num_hidden_layers):
+            state_dict[f"layers.{layer_idx}.self_attn.rank_util.rank"] = torch.arange(
+                0, neuron_config.tp_degree, dtype=torch.int32
+            )
+            q_norm_key = f"layers.{layer_idx}.self_attn.q_norm.weight"
+            if q_norm_key in state_dict:
+                state_dict[f"layers.{layer_idx}.self_attn.q_layernorm.weight"] = state_dict.pop(q_norm_key)
+            k_norm_key = f"layers.{layer_idx}.self_attn.k_norm.weight"
+            if k_norm_key in state_dict:
+                state_dict[f"layers.{layer_idx}.self_attn.k_layernorm.weight"] = state_dict.pop(k_norm_key)
+
+            if config.neuron_config.fused_qkv:
+                attr = "weight"
+                q_key = f"layers.{layer_idx}.self_attn.q_proj.{attr}"
+                k_key = f"layers.{layer_idx}.self_attn.k_proj.{attr}"
+                v_key = f"layers.{layer_idx}.self_attn.v_proj.{attr}"
+                if q_key in state_dict and k_key in state_dict and v_key in state_dict:
+                    state_dict[f"layers.{layer_idx}.self_attn.Wqkv.{attr}"] = torch.cat(
+                        [state_dict[q_key], state_dict[k_key], state_dict[v_key]]
+                    )
+                    del state_dict[q_key]
+                    del state_dict[k_key]
+                    del state_dict[v_key]
+
+        state_dict["rank_util.rank"] = torch.arange(0, neuron_config.tp_degree, dtype=torch.int32)
+        return state_dict
+
+    @staticmethod
+    def update_state_dict_for_tied_weights(state_dict):
+        state_dict["lm_head.weight"] = state_dict["embed_tokens.weight"].clone()
+
+    @classmethod
+    def get_config_cls(cls):
+        return Gemma4InferenceConfig
