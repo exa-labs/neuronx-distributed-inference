@@ -447,6 +447,9 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
+        if seq_ids is not None:
+            seq_ids = seq_ids.to(torch.long)
+
         projected_states_qkvz = self.in_proj_qkvz(hidden_states)
         projected_states_ba = self.in_proj_ba(hidden_states)
         query, key, value, z, b, a = self.fix_query_key_value_ordering(
