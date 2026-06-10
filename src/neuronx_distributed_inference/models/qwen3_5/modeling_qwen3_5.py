@@ -40,6 +40,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed.parallel_layers.utils import set_tensor_model_parallel_attributes
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
     ParallelEmbedding,
@@ -403,6 +404,12 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
 
         self.dt_bias = nn.Parameter(torch.ones(self.local_num_v_heads))
         self.A_log = nn.Parameter(torch.zeros(self.local_num_v_heads))
+
+        # Mark plain per-head parameters for TP-0-dim checkpoint sharding;
+        # the conv channels are reordered into per-rank slabs by
+        # convert_qwen3_5_hf_to_neuron_state_dict.
+        for param in (self.conv1d.weight, self.dt_bias, self.A_log):
+            set_tensor_model_parallel_attributes(param, True, 0, 1, num_partitions=tp_degree)
 
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
 
@@ -920,6 +927,25 @@ def convert_qwen3_5_hf_to_neuron_state_dict(state_dict: dict, config: InferenceC
     state_dict["rank_util.rank"] = torch.arange(
         0, neuron_config.tp_degree, dtype=torch.int32
     )
+
+    # Reorder DeltaNet conv channels from the HF global [q | k | v] layout
+    # into per-rank slabs [q_0 k_0 v_0 | q_1 k_1 v_1 | ...] so that a
+    # contiguous 0-dim TP shard hands each rank its local (q, k, v) channels.
+    tp = neuron_config.tp_degree
+    key_dim = config.linear_num_key_heads * config.linear_key_head_dim
+    value_dim = config.linear_num_value_heads * config.linear_value_head_dim
+    for l in range(config.num_hidden_layers):  # noqa: E741
+        key = f"layers.{l}.linear_attn.conv1d.weight"
+        if key not in state_dict or tp == 1:
+            continue
+        w = state_dict[key]
+        q, k, v = torch.split(w, [key_dim, key_dim, value_dim], dim=0)
+        qs = torch.chunk(q, tp, dim=0)
+        ks = torch.chunk(k, tp, dim=0)
+        vs = torch.chunk(v, tp, dim=0)
+        state_dict[key] = torch.cat(
+            [t for r in range(tp) for t in (qs[r], ks[r], vs[r])], dim=0
+        ).contiguous()
 
     for l in range(config.num_hidden_layers):  # noqa: E741
         if not _is_moe_layer(config, l):
