@@ -221,10 +221,13 @@ def chunk_gated_delta_rule(
     k_beta = key * beta.unsqueeze(-1)
     v_beta = value * beta.unsqueeze(-1)
 
-    mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
+    # multiplicative masks instead of masked_fill: high-rank masked_fill selects
+    # hit a neuronx-cc codegen stride limit (NCC_IBCG901)
+    keep_strict_lower = torch.tril(
+        torch.ones(chunk_size, chunk_size, dtype=decay_mask.dtype, device=query.device),
+        diagonal=-1,
     )
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask) * keep_strict_lower
     for i in range(1, chunk_size):
         row = attn[..., i, :i].clone()
         sub = attn[..., :i, :i].clone()
@@ -241,8 +244,9 @@ def chunk_gated_delta_rule(
     else:
         last_recurrent_state = initial_state.to(torch.float32)
 
-    mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
+    keep_lower = torch.tril(
+        torch.ones(chunk_size, chunk_size, dtype=decay_mask.dtype, device=query.device),
+        diagonal=0,
     )
 
     core_attn_out = torch.zeros(
@@ -251,7 +255,7 @@ def chunk_gated_delta_rule(
     )
     for i in range(num_chunks):
         q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
+        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]) * keep_lower
         v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
         v_new = v_i - v_prime
         attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
