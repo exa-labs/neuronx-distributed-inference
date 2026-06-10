@@ -1041,6 +1041,12 @@ class NeuronQwen3_5ForCausalLM(NeuronBaseForCausalLM):
     def get_model_wrapper_cls(self):
         return Qwen3_5ModelWrapper
 
+    def get_compiler_args(self):
+        return (
+            "--enable-saturate-infinity --enable-mixed-precision-accumulation "
+            "--auto-cast=none --model-type transformer -O1"
+        )
+
     @staticmethod
     def load_hf_model(model_path, **kwargs):
         from transformers import AutoModelForCausalLM
