@@ -448,14 +448,17 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
         mixed_ba = mixed_ba.view(*new_tensor_shape_ba)
         # NOTE: torch.split / torch.chunk miscompile on Trainium (neuronx-cc
         # produces wrong data for multi-output splits of a shared base in this
-        # graph); use explicit single-range slices instead.
+        # graph), and plain strided slices trip a PGTiling compiler assert at
+        # tp=1; index_select with constant indices avoids both.
         dk, dv = self.head_k_dim, nvk * self.head_v_dim
-        query = mixed_qkvz[..., :dk]
-        key = mixed_qkvz[..., dk:2 * dk]
-        value = mixed_qkvz[..., 2 * dk:2 * dk + dv]
-        z = mixed_qkvz[..., 2 * dk + dv:2 * dk + 2 * dv]
-        b = mixed_ba[..., :nvk]
-        a = mixed_ba[..., nvk:2 * nvk]
+        dev = mixed_qkvz.device
+        idx = torch.arange(2 * dk + 2 * dv, device=dev)
+        query = mixed_qkvz.index_select(-1, idx[:dk])
+        key = mixed_qkvz.index_select(-1, idx[dk:2 * dk])
+        value = mixed_qkvz.index_select(-1, idx[2 * dk:2 * dk + dv])
+        z = mixed_qkvz.index_select(-1, idx[2 * dk + dv:2 * dk + 2 * dv])
+        b = mixed_ba.index_select(-1, idx[:nvk])
+        a = mixed_ba.index_select(-1, idx[nvk:2 * nvk])
 
         value = value.reshape(batch, seq, self.local_num_v_heads, self.head_v_dim)
         z = z.reshape(batch, seq, self.local_num_v_heads, self.head_v_dim)
