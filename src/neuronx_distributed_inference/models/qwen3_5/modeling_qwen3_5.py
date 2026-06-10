@@ -40,11 +40,11 @@ import torch.nn.functional as F
 from torch import nn
 
 from neuronx_distributed.parallel_layers import parallel_state
-from neuronx_distributed.parallel_layers.utils import set_tensor_model_parallel_attributes
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
     ParallelEmbedding,
     RowParallelLinear,
+    SPMDRank,
 )
 
 from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
@@ -392,24 +392,26 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
             dtype=dtype,
         )
 
-        # Depthwise causal conv over the local (q, k, v) channels.
+        # Depthwise causal conv plus the per-head dt_bias / A_log gates.
+        # NxD's checkpoint sharder only shards parameters owned by parallel
+        # layer classes, so these plain parameters are kept full-size
+        # (replicated on every rank) and sliced to the local channels/heads at
+        # forward time via the SPMD rank. The conv channels are reordered into
+        # per-rank [q | k | v] slabs by convert_qwen3_5_hf_to_neuron_state_dict
+        # so the local slice is contiguous.
+        self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = nn.Conv1d(
-            in_channels=self.local_conv_dim,
-            out_channels=self.local_conv_dim,
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
             kernel_size=self.kernel_size,
-            groups=self.local_conv_dim,
+            groups=self.conv_dim,
             padding=self.kernel_size - 1,
             bias=False,
         )
 
-        self.dt_bias = nn.Parameter(torch.ones(self.local_num_v_heads))
-        self.A_log = nn.Parameter(torch.zeros(self.local_num_v_heads))
-
-        # Mark plain per-head parameters for TP-0-dim checkpoint sharding;
-        # the conv channels are reordered into per-rank slabs by
-        # convert_qwen3_5_hf_to_neuron_state_dict.
-        for param in (self.conv1d.weight, self.dt_bias, self.A_log):
-            set_tensor_model_parallel_attributes(param, True, 0, 1, num_partitions=tp_degree)
+        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+        self.A_log = nn.Parameter(torch.zeros(self.num_v_heads))
+        self.rank_util = SPMDRank(world_size=tp_degree)
 
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
 
@@ -472,6 +474,19 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
         if seq_ids is not None:
             seq_ids = seq_ids.to(torch.long)
 
+        # Local slices of the replicated conv / per-head parameters
+        # (conv channels are stored in per-rank slabs; see weight conversion).
+        rank = self.rank_util.get_rank().to(torch.long)
+        conv_idx = rank * self.local_conv_dim + torch.arange(
+            self.local_conv_dim, device=hidden_states.device
+        )
+        head_idx = rank * self.local_num_v_heads + torch.arange(
+            self.local_num_v_heads, device=hidden_states.device
+        )
+        conv_weight = self.conv1d.weight.index_select(0, conv_idx)
+        dt_bias = self.dt_bias.index_select(0, head_idx)
+        A_log = self.A_log.index_select(0, head_idx)
+
         projected_states_qkvz = self.in_proj_qkvz(hidden_states)
         projected_states_ba = self.in_proj_ba(hidden_states)
         query, key, value, z, b, a = self.fix_query_key_value_ordering(
@@ -485,7 +500,12 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
         if is_for_context_encoding:
             # Fresh sequence: zero conv state. Run the full causal conv and
             # save the trailing (kernel_size - 1) inputs for decode.
-            conv_out = self.conv1d(mixed_qkv)[:, :, :seq_len]
+            conv_out = F.conv1d(
+                mixed_qkv,
+                conv_weight,
+                groups=self.local_conv_dim,
+                padding=self.kernel_size - 1,
+            )[:, :, :seq_len]
             mixed_qkv_post_conv = F.silu(conv_out)
             new_conv_state = F.pad(
                 mixed_qkv.float(), (self.kernel_size - 1 - seq_len, 0)
@@ -494,7 +514,7 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
             # Decode: shift cached conv inputs, append the new token.
             prev_conv_state = self.conv_state[seq_ids].to(mixed_qkv.dtype)
             conv_input = torch.cat([prev_conv_state, mixed_qkv], dim=-1)
-            weight = self.conv1d.weight.squeeze(1)  # [conv_dim, kernel]
+            weight = conv_weight.squeeze(1)  # [local_conv_dim, kernel]
             conv_out = (conv_input * weight.unsqueeze(0)).sum(dim=-1, keepdim=True)
             mixed_qkv_post_conv = F.silu(conv_out)
             new_conv_state = conv_input[:, :, 1:].float()
@@ -509,7 +529,7 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
         value = value.transpose(1, 2).reshape(batch_size, seq_len, -1, self.head_v_dim)
 
         beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
 
         if self.local_num_v_heads // self.local_num_k_heads > 1:
             query = query.repeat_interleave(self.local_num_v_heads // self.local_num_k_heads, dim=2)
@@ -929,14 +949,20 @@ def convert_qwen3_5_hf_to_neuron_state_dict(state_dict: dict, config: InferenceC
     )
 
     # Reorder DeltaNet conv channels from the HF global [q | k | v] layout
-    # into per-rank slabs [q_0 k_0 v_0 | q_1 k_1 v_1 | ...] so that a
-    # contiguous 0-dim TP shard hands each rank its local (q, k, v) channels.
+    # into per-rank slabs [q_0 k_0 v_0 | q_1 k_1 v_1 | ...] so each rank's
+    # local (q, k, v) channels form one contiguous slice of the replicated
+    # weight, and provide a per-module SPMD rank tensor for the slicing.
     tp = neuron_config.tp_degree
     key_dim = config.linear_num_key_heads * config.linear_key_head_dim
     value_dim = config.linear_num_value_heads * config.linear_value_head_dim
     for l in range(config.num_hidden_layers):  # noqa: E741
         key = f"layers.{l}.linear_attn.conv1d.weight"
-        if key not in state_dict or tp == 1:
+        if key not in state_dict:
+            continue
+        state_dict[f"layers.{l}.linear_attn.rank_util.rank"] = torch.arange(
+            0, tp, dtype=torch.int32
+        )
+        if tp == 1:
             continue
         w = state_dict[key]
         q, k, v = torch.split(w, [key_dim, key_dim, value_dim], dim=0)
