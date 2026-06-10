@@ -207,12 +207,14 @@ def chunk_gated_delta_rule(
     query = l2norm(query, dim=-1) * scale
     key = l2norm(key, dim=-1)
 
-    # reshape into chunks
+    # reshape into chunks, flattening (batch, heads) into one dim: rank-5
+    # tensors here exceed neuronx-cc stride/vectorizer limits (NCC_IBCG901/IMGN901)
+    bh = batch_size * num_heads
     query, key, value = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value)
+        x.reshape(bh, -1, chunk_size, x.shape[-1]) for x in (query, key, value)
     ]
-    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
-    beta = beta.reshape(beta.shape[0], beta.shape[1], -1, chunk_size)
+    g = g.reshape(bh, -1, chunk_size)
+    beta = beta.reshape(bh, -1, chunk_size)
     num_chunks = total_sequence_length // chunk_size
 
     g = g.cumsum(dim=-1)
@@ -239,38 +241,38 @@ def chunk_gated_delta_rule(
 
     if initial_state is None:
         last_recurrent_state = torch.zeros(
-            batch_size, num_heads, k_head_dim, v_head_dim, dtype=torch.float32, device=query.device
+            bh, k_head_dim, v_head_dim, dtype=torch.float32, device=query.device
         )
     else:
-        last_recurrent_state = initial_state.to(torch.float32)
+        last_recurrent_state = initial_state.to(torch.float32).reshape(bh, k_head_dim, v_head_dim)
 
     keep_lower = torch.tril(
         torch.ones(chunk_size, chunk_size, dtype=decay_mask.dtype, device=query.device),
         diagonal=0,
     )
 
-    core_attn_out = torch.zeros(
-        batch_size, num_heads, num_chunks, chunk_size, v_head_dim,
-        dtype=torch.float32, device=query.device,
-    )
+    chunk_outs = []
     for i in range(num_chunks):
-        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]) * keep_lower
-        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
+        q_i, k_i, v_i = query[:, i], key[:, i], value[:, i]
+        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, i]) * keep_lower
+        v_prime = (k_cumdecay[:, i]) @ last_recurrent_state
         v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
-        core_attn_out[:, :, i] = attn_inter + attn @ v_new
-        g_last = g[:, :, i, -1, None, None].exp()
-        last_recurrent_state = (
-            last_recurrent_state * g_last
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
-        )
+        attn_inter = (q_i * g[:, i, :, None].exp()) @ last_recurrent_state
+        chunk_outs.append(attn_inter + attn @ v_new)
+        g_last = g[:, i, -1, None, None].exp()
+        k_decay = k_i * (g[:, i, -1, None] - g[:, i]).exp()[..., None]
+        state_update = last_recurrent_state * 0
+        for c in range(chunk_size):
+            state_update = state_update + k_decay[:, c, :, None] * v_new[:, c, None, :]
+        last_recurrent_state = last_recurrent_state * g_last + state_update
 
-    core_attn_out = core_attn_out.reshape(
-        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
-    )
+    core_attn_out = torch.cat(chunk_outs, dim=-2)
+    core_attn_out = core_attn_out.reshape(batch_size, num_heads, -1, v_head_dim)
     core_attn_out = core_attn_out[:, :, :sequence_length]
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    last_recurrent_state = last_recurrent_state.reshape(
+        batch_size, num_heads, k_head_dim, v_head_dim
+    )
     return core_attn_out, last_recurrent_state
 
 
@@ -328,7 +330,8 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
 
     State layout (per layer):
       - ``conv_state``      [max_batch, conv_dim, kernel_size - 1]
-      - ``recurrent_state`` [max_batch, num_v_heads, head_k_dim, head_v_dim]
+      - ``recurrent_state`` [max_batch, num_v_heads * head_k_dim * head_v_dim]
+        (stored flat: high-rank state buffers trip neuronx-cc vectorizer)
     Both are indexed by ``seq_ids`` so continuous batching maps each vLLM
     sequence to a fixed state slot, analogous to the KV cache manager.
 
@@ -412,7 +415,7 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
         )
         self.recurrent_state = nn.Parameter(
             torch.zeros(
-                max_batch, self.local_num_v_heads, self.head_k_dim, self.head_v_dim,
+                max_batch, self.local_num_v_heads * self.head_k_dim * self.head_v_dim,
                 dtype=torch.float32,
             ),
             requires_grad=False,
@@ -510,7 +513,9 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
                 query, key, value, g=g, beta=beta, initial_state=None
             )
         else:
-            initial_state = self.recurrent_state[seq_ids]
+            initial_state = self.recurrent_state[seq_ids].reshape(
+                batch_size, -1, self.head_k_dim, self.head_v_dim
+            )
             core_attn_out, new_recurrent_state = recurrent_gated_delta_rule(
                 query, key, value, g=g, beta=beta, initial_state=initial_state
             )
@@ -518,7 +523,7 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
         if seq_ids is not None:
             self.next_conv_state = self.conv_state.index_copy(0, seq_ids, new_conv_state)
             self.next_recurrent_state = self.recurrent_state.index_copy(
-                0, seq_ids, new_recurrent_state.float()
+                0, seq_ids, new_recurrent_state.reshape(batch_size, -1).float()
             )
             if hidden_states.device.type != "xla":
                 # Eager (CPU) execution: persist state directly. Under XLA
@@ -966,6 +971,8 @@ class Qwen3_5ModelInstance(DecoderModelInstance):
 
 
 class Qwen3_5ModelWrapper(ModelWrapper):
+    """ModelWrapper that aliases DeltaNet conv/recurrent state buffers."""
+
     def get_model_instance(self):
         return Qwen3_5ModelInstance(
             model_cls=self.model_cls,
