@@ -51,6 +51,10 @@ from neuronx_distributed_inference.models.model_base import (
     NeuronBaseForCausalLM,
     NeuronBaseModel,
 )
+from neuronx_distributed_inference.models.model_wrapper import (
+    DecoderModelInstance,
+    ModelWrapper,
+)
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 
 
@@ -396,19 +400,23 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
 
         max_batch = config.neuron_config.max_batch_size
-        self.register_buffer(
-            "conv_state",
+        # nn.Parameter (not buffer) so torch_neuronx input/output aliasing can
+        # match them by data_ptr against named_parameters() during trace.
+        self.conv_state = nn.Parameter(
             torch.zeros(max_batch, self.local_conv_dim, self.kernel_size - 1, dtype=torch.float32),
-            persistent=False,
+            requires_grad=False,
         )
-        self.register_buffer(
-            "recurrent_state",
+        self.recurrent_state = nn.Parameter(
             torch.zeros(
                 max_batch, self.local_num_v_heads, self.head_k_dim, self.head_v_dim,
                 dtype=torch.float32,
             ),
-            persistent=False,
+            requires_grad=False,
         )
+        # Updated full-buffer states for the current forward; returned as extra
+        # traced outputs and aliased back onto conv_state / recurrent_state.
+        self.next_conv_state = None
+        self.next_recurrent_state = None
 
     def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
         """Split the interleaved qkvz / ba projections into per-head tensors."""
@@ -504,8 +512,15 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
             )
 
         if seq_ids is not None:
-            self.conv_state.index_copy_(0, seq_ids, new_conv_state)
-            self.recurrent_state.index_copy_(0, seq_ids, new_recurrent_state.float())
+            self.next_conv_state = self.conv_state.index_copy(0, seq_ids, new_conv_state)
+            self.next_recurrent_state = self.recurrent_state.index_copy(
+                0, seq_ids, new_recurrent_state.float()
+            )
+            if hidden_states.device.type != "xla":
+                # Eager (CPU) execution: persist state directly. Under XLA
+                # trace, states flow out as aliased outputs instead.
+                self.conv_state.copy_(self.next_conv_state)
+                self.recurrent_state.copy_(self.next_recurrent_state)
 
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
@@ -755,6 +770,7 @@ class NeuronQwen3_5DecoderLayer(nn.Module):
         self.layer_type = config.layer_types[layer_idx]
         self.is_linear_attention = self.layer_type == "linear_attention"
 
+        self.linear_attn = None
         if self.is_linear_attention:
             self.linear_attn = NeuronQwen3_5GatedDeltaNet(config)
         else:
@@ -872,6 +888,16 @@ class NeuronQwen3_5Model(NeuronBaseModel):
             dtype=config.neuron_config.torch_dtype,
         )
 
+    def linear_attn_modules(self):
+        return [layer.linear_attn for layer in self.layers if layer.linear_attn is not None]
+
+    def forward(self, *args, **kwargs):
+        outputs = super().forward(*args, **kwargs)
+        for la in self.linear_attn_modules():
+            if la.next_conv_state is not None:
+                outputs = outputs + [la.next_conv_state, la.next_recurrent_state]
+        return outputs
+
 
 def convert_qwen3_5_hf_to_neuron_state_dict(state_dict: dict, config: InferenceConfig) -> dict:
     """Convert a HF qwen3_next / qwen3_5 checkpoint to the Neuron layout.
@@ -921,10 +947,36 @@ def convert_qwen3_5_hf_to_neuron_state_dict(state_dict: dict, config: InferenceC
     return state_dict
 
 
+class Qwen3_5ModelInstance(DecoderModelInstance):
+    """DecoderModelInstance that also aliases DeltaNet conv/recurrent state
+    buffers onto the extra traced outputs appended after the KV cache."""
+
+    def get(self, bucket_rank, **kwargs):
+        module, aliases = super().get(bucket_rank, **kwargs)
+        next_idx = max(aliases.values()) + 1 if aliases else 1
+        for la in module.linear_attn_modules():
+            aliases[la.conv_state] = next_idx
+            aliases[la.recurrent_state] = next_idx + 1
+            next_idx += 2
+        return module, aliases
+
+
+class Qwen3_5ModelWrapper(ModelWrapper):
+    def get_model_instance(self):
+        return Qwen3_5ModelInstance(
+            model_cls=self.model_cls,
+            config=self.config,
+            **self.model_init_kwargs,
+        )
+
+
 class NeuronQwen3_5ForCausalLM(NeuronBaseForCausalLM):
     """Application head for Qwen3.5 / Qwen3-Next checkpoints."""
 
     _model_cls = NeuronQwen3_5Model
+
+    def get_model_wrapper_cls(self):
+        return Qwen3_5ModelWrapper
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
