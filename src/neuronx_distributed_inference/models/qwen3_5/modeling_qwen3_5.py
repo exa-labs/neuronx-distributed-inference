@@ -446,15 +446,16 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
 
         mixed_qkvz = mixed_qkvz.view(*new_tensor_shape_qkvz)
         mixed_ba = mixed_ba.view(*new_tensor_shape_ba)
-        split_arg_list_qkvz = [
-            self.head_k_dim,
-            self.head_k_dim,
-            nvk * self.head_v_dim,
-            nvk * self.head_v_dim,
-        ]
-        split_arg_list_ba = [nvk, nvk]
-        query, key, value, z = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=3)
-        b, a = torch.split(mixed_ba, split_arg_list_ba, dim=3)
+        # NOTE: torch.split / torch.chunk miscompile on Trainium (neuronx-cc
+        # produces wrong data for multi-output splits of a shared base in this
+        # graph); use explicit single-range slices instead.
+        dk, dv = self.head_k_dim, nvk * self.head_v_dim
+        query = mixed_qkvz[..., :dk]
+        key = mixed_qkvz[..., dk:2 * dk]
+        value = mixed_qkvz[..., 2 * dk:2 * dk + dv]
+        z = mixed_qkvz[..., 2 * dk + dv:2 * dk + 2 * dv]
+        b = mixed_ba[..., :nvk]
+        a = mixed_ba[..., nvk:2 * nvk]
 
         value = value.reshape(batch, seq, self.local_num_v_heads, self.head_v_dim)
         z = z.reshape(batch, seq, self.local_num_v_heads, self.head_v_dim)
@@ -519,11 +520,10 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
             mixed_qkv_post_conv = F.silu(conv_out)
             new_conv_state = conv_input[:, :, 1:].float()
 
-        query, key, value = torch.split(
-            mixed_qkv_post_conv,
-            [self.local_key_dim, self.local_key_dim, self.local_value_dim],
-            dim=1,
-        )
+        kd, vd = self.local_key_dim, self.local_value_dim
+        query = mixed_qkv_post_conv[:, :kd]
+        key = mixed_qkv_post_conv[:, kd:2 * kd]
+        value = mixed_qkv_post_conv[:, 2 * kd:2 * kd + vd]
         query = query.transpose(1, 2).reshape(batch_size, seq_len, -1, self.head_k_dim)
         key = key.transpose(1, 2).reshape(batch_size, seq_len, -1, self.head_k_dim)
         value = value.transpose(1, 2).reshape(batch_size, seq_len, -1, self.head_v_dim)
@@ -672,7 +672,8 @@ class NeuronQwen3_5Attention(nn.Module):
 
         q = self.q_proj(hidden_states)
         q = q.view(batch_size, seq_len, self.local_num_heads, self.head_dim * 2)
-        query_states, gate = torch.chunk(q, 2, dim=-1)
+        query_states = q[..., : self.head_dim]
+        gate = q[..., self.head_dim:]
         gate = gate.reshape(batch_size, seq_len, -1)
 
         key_states = self.k_proj(hidden_states).view(
