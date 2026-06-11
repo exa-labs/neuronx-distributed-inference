@@ -1046,10 +1046,11 @@ class NeuronQwen3_5ForCausalLM(NeuronBaseForCausalLM):
         return Qwen3_5ModelWrapper
 
     def get_compiler_args(self):
-        return (
-            "--enable-saturate-infinity --enable-mixed-precision-accumulation "
-            "--auto-cast=none --model-type transformer -O1"
-        )
+        # Return None so the base ModelWrapper uses its default flags, which
+        # applies -O1 for context encoding and -O2 for token generation.
+        # Using -O1 for TKG triggers a PGTiling compiler crash (NCC_IPCC901)
+        # at large context lengths.
+        return None
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
