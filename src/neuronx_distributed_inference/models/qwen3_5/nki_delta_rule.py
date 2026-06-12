@@ -57,9 +57,9 @@ def nki_recurrent_gated_delta_rule(
     seq_len = q_ref.shape[2]  # T is last dim for q/k (column-major)
     dv = v_ref.shape[2]   # Dv = 128
 
-    # Allocate HBM outputs
-    out_ref = nl.ndarray((bh, seq_len, dv), dtype=q_ref.dtype, buffer=nl.hbm)
-    final_state_ref = nl.ndarray((bh, dk, dv), dtype=nl.float32, buffer=nl.hbm)
+    # Allocate shared HBM outputs (required by NKI for kernel return tensors)
+    out_ref = nl.ndarray((bh, seq_len, dv), dtype=q_ref.dtype, buffer=nl.shared_hbm)
+    final_state_ref = nl.ndarray((bh, dk, dv), dtype=nl.float32, buffer=nl.shared_hbm)
 
     # Pre-allocate a ones vector [1, 128] for scalar broadcasting via nc_matmul
     ones_row = nl.ndarray((1, _D), dtype=nl.float32, buffer=nl.sbuf)
