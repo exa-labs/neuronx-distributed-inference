@@ -539,8 +539,18 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
             key = key.repeat_interleave(self.local_num_v_heads // self.local_num_k_heads, dim=2)
 
         if is_for_context_encoding:
-            core_attn_out, new_recurrent_state = chunk_gated_delta_rule(
-                query, key, value, g=g, beta=beta, initial_state=None
+            # Use the recurrent (sequential) form for CTE on Neuron.
+            # The chunked-parallel form triggers neuronx-cc PGTiling
+            # (NCC_IPCC901) at ANY seq_len >= chunk_size due to the
+            # complex intra-chunk graph structure. The recurrent form
+            # compiles reliably because its graph is a simple sequential
+            # chain of element-wise ops (proven by TKG compilation).
+            initial_state = torch.zeros(
+                batch_size, query.shape[2], self.head_k_dim, self.head_v_dim,
+                dtype=torch.float32, device=query.device,
+            )
+            core_attn_out, new_recurrent_state = recurrent_gated_delta_rule(
+                query, key, value, g=g, beta=beta, initial_state=initial_state
             )
         else:
             initial_state = self.recurrent_state[seq_ids].reshape(
