@@ -33,11 +33,24 @@ can be validated against the HF CPU model.
 """
 
 import gc
+import os
 from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+# NKI kernel import — guarded since nki is only available in Neuron environments
+_USE_NKI_DELTA_RULE = os.environ.get("QWEN35_USE_NKI_DELTA_RULE", "0") == "1"
+_NKI_AVAILABLE = False
+if _USE_NKI_DELTA_RULE:
+    try:
+        from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
+            nki_recurrent_gated_delta_rule,
+        )
+        _NKI_AVAILABLE = True
+    except ImportError:
+        pass
 
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
@@ -326,6 +339,66 @@ def recurrent_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
+def nki_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+):
+    """NKI-accelerated gated delta rule for CTE (context encoding).
+
+    Same interface as recurrent_gated_delta_rule but dispatches to the
+    custom NKI kernel that bypasses XLA trace and PGTiling. Handles the
+    input layout transformation (transpose q/k to column-major) expected
+    by the NKI kernel.
+
+    Inputs: [B, S, H, D] shaped (same as recurrent_gated_delta_rule).
+    """
+    initial_dtype = query.dtype
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+    ]
+
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+
+    scale = 1 / (query.shape[-1] ** 0.5)
+    query = l2norm(query, dim=-1) * scale
+    key = l2norm(key, dim=-1)
+
+    # Pre-compute exp(g) — the NKI kernel expects it pre-computed
+    exp_g = g.exp().squeeze(-1)  # [B, H, T]
+
+    # Reshape for NKI: merge batch and heads → BH
+    bh = batch_size * num_heads
+    # q, k: [B, H, T, D] → [BH, D, T] (column-major for [128,1] loads)
+    q_col = query.reshape(bh, sequence_length, k_head_dim).transpose(1, 2).contiguous()
+    k_col = key.reshape(bh, sequence_length, k_head_dim).transpose(1, 2).contiguous()
+    # v: [B, H, T, D] → [BH, T, D] (row-major for [1,256] loads)
+    v_row = value.reshape(bh, sequence_length, v_head_dim).contiguous()
+    # exp_g: [B, H, T] → [BH, T]
+    exp_g_flat = exp_g.reshape(bh, sequence_length).contiguous()
+    # beta: [B, H, T, 1] → [BH, T]
+    beta_flat = beta.reshape(bh, sequence_length, 1).squeeze(-1).contiguous()
+    # state: [B, H, Dk, Dv] → [BH, Dk, Dv]
+    state_flat = initial_state.reshape(bh, k_head_dim, v_head_dim).contiguous()
+
+    # Call NKI kernel
+    out_flat, final_state_flat = nki_recurrent_gated_delta_rule(
+        q_col, k_col, v_row, exp_g_flat, beta_flat, state_flat
+    )
+
+    # Reshape outputs back: [BH, T, D] → [B, S, H, D]
+    core_attn_out = out_flat.reshape(
+        batch_size, num_heads, sequence_length, v_head_dim
+    ).transpose(1, 2).contiguous().to(initial_dtype)
+    final_state = final_state_flat.reshape(batch_size, num_heads, k_head_dim, v_head_dim)
+
+    return core_attn_out, final_state
+
+
 class NeuronQwen3_5GatedDeltaNet(nn.Module):
     """Gated DeltaNet linear-attention mixer with per-sequence on-module state.
 
@@ -539,19 +612,23 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
             key = key.repeat_interleave(self.local_num_v_heads // self.local_num_k_heads, dim=2)
 
         if is_for_context_encoding:
-            # Use the recurrent (sequential) form for CTE on Neuron.
+            # CTE (context encoding) for DeltaNet layers.
             # The chunked-parallel form triggers neuronx-cc PGTiling
-            # (NCC_IPCC901) at ANY seq_len >= chunk_size due to the
-            # complex intra-chunk graph structure. The recurrent form
-            # compiles reliably because its graph is a simple sequential
-            # chain of element-wise ops (proven by TKG compilation).
+            # (NCC_IPCC901) at ANY seq_len >= chunk_size. Two alternatives:
+            # - NKI kernel: custom tiled kernel bypasses XLA/neuronx-cc entirely
+            # - Recurrent form: simple sequential chain the compiler can handle
             initial_state = torch.zeros(
                 batch_size, query.shape[2], self.head_k_dim, self.head_v_dim,
                 dtype=torch.float32, device=query.device,
             )
-            core_attn_out, new_recurrent_state = recurrent_gated_delta_rule(
-                query, key, value, g=g, beta=beta, initial_state=initial_state
-            )
+            if _USE_NKI_DELTA_RULE and _NKI_AVAILABLE:
+                core_attn_out, new_recurrent_state = nki_gated_delta_rule(
+                    query, key, value, g=g, beta=beta, initial_state=initial_state
+                )
+            else:
+                core_attn_out, new_recurrent_state = recurrent_gated_delta_rule(
+                    query, key, value, g=g, beta=beta, initial_state=initial_state
+                )
         else:
             initial_state = self.recurrent_state[seq_ids].reshape(
                 batch_size, -1, self.head_k_dim, self.head_v_dim
