@@ -1133,11 +1133,16 @@ class NeuronQwen3_5ForCausalLM(NeuronBaseForCausalLM):
         return Qwen3_5ModelWrapper
 
     def get_compiler_args(self):
-        # Return None so the base ModelWrapper uses its default flags, which
-        # applies -O1 for context encoding and -O2 for token generation.
-        # Using -O1 for TKG triggers a PGTiling compiler crash (NCC_IPCC901)
-        # at large context lengths.
-        return None
+        # Force -O1 for both CTE and TKG.  The DeltaNet recurrent layers produce
+        # a graph that neuronx-cc's PGTiling pass (NCC_IPCC901) can't handle at
+        # -O2 (the default for TKG).  -O1 uses Modular flow which sidesteps the
+        # PGTiling crash at the cost of slightly higher function-call overhead.
+        return (
+            "--auto-cast=none --model-type=transformer "
+            "--tensorizer-options='--enable-ccop-compute-overlap "
+            "--cc-pipeline-tiling-factor=2 --vectorize-strided-dma ' "
+            f"--lnc={self.neuron_config.logical_nc_config} -O1"
+        )
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
