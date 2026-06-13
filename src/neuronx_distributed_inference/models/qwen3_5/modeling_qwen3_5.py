@@ -66,6 +66,8 @@ from neuronx_distributed_inference.models.model_base import (
     NeuronBaseModel,
 )
 from neuronx_distributed_inference.models.model_wrapper import (
+    CONTEXT_ENCODING_MODEL_TAG,
+    TOKEN_GENERATION_MODEL_TAG,
     DecoderModelInstance,
     ModelWrapper,
 )
@@ -1132,15 +1134,30 @@ class NeuronQwen3_5ForCausalLM(NeuronBaseForCausalLM):
     def get_model_wrapper_cls(self):
         return Qwen3_5ModelWrapper
 
+    def enable_context_encoding(self, **model_init_kwargs):
+        self.compile_tag = CONTEXT_ENCODING_MODEL_TAG
+        super().enable_context_encoding(**model_init_kwargs)
+
+    def enable_token_generation(self, **model_init_kwargs):
+        self.compile_tag = TOKEN_GENERATION_MODEL_TAG
+        super().enable_token_generation(**model_init_kwargs)
+
     def get_compiler_args(self):
         # Force -O1 for both CTE and TKG.  The DeltaNet recurrent layers produce
         # a graph that neuronx-cc's PGTiling pass (NCC_IPCC901) can't handle at
         # -O2 (the default for TKG).  -O1 uses Modular flow which sidesteps the
         # PGTiling crash at the cost of slightly higher function-call overhead.
+        #
+        # CTE uses cc-pipeline-tiling-factor=2 for compute-communication overlap.
+        # TKG must use tiling-factor=1: DeltaNet's recurrent state propagation at
+        # batch=14 triggers the PGTiling assertion (NCC_IPCC901) even at -O1 when
+        # tiling > 1.
+        is_tkg = getattr(self, "compile_tag", None) == TOKEN_GENERATION_MODEL_TAG
+        tiling_factor = 1 if is_tkg else 2
         return (
             "--auto-cast=none --model-type=transformer "
             "--tensorizer-options='--enable-ccop-compute-overlap "
-            "--cc-pipeline-tiling-factor=2 --vectorize-strided-dma ' "
+            f"--cc-pipeline-tiling-factor={tiling_factor} --vectorize-strided-dma ' "
             f"--lnc={self.neuron_config.logical_nc_config} -O1"
         )
 
