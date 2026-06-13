@@ -1140,6 +1140,12 @@ class NeuronQwen3_5ForCausalLM(NeuronBaseForCausalLM):
 
     def enable_token_generation(self, **model_init_kwargs):
         self.compile_tag = TOKEN_GENERATION_MODEL_TAG
+        # Must set cc_pipeline_tiling_factor=1 BEFORE super() traces the model.
+        # The default model_wrapper __init__ does this at line 88, but only when
+        # compiler_args is None.  With custom get_compiler_args(), that path is
+        # skipped, so the attention layers would be traced with tiling=2 baked
+        # into the XLA graph — causing PGTiling (NCC_IPCC901) at batch=14.
+        self.neuron_config.cc_pipeline_tiling_factor = 1
         super().enable_token_generation(**model_init_kwargs)
 
     def get_compiler_args(self):
