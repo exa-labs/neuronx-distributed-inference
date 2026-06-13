@@ -40,17 +40,20 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-# NKI kernel import — guarded since nki is only available in Neuron environments
-_USE_NKI_DELTA_RULE = os.environ.get("QWEN35_USE_NKI_DELTA_RULE", "0") == "1"
-_NKI_AVAILABLE = False
-if _USE_NKI_DELTA_RULE:
-    try:
-        from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
-            nki_recurrent_gated_delta_rule,
-        )
-        _NKI_AVAILABLE = True
-    except ImportError:
-        pass
+# NKI kernel for the delta-rule recurrence.  Always use NKI when available —
+# the recurrent XLA graph triggers PGTiling (NCC_IPCC901) at batch>=8.
+try:
+    from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
+        nki_recurrent_gated_delta_rule,
+    )
+    _NKI_AVAILABLE = True
+except ImportError:
+    _NKI_AVAILABLE = False
+# Legacy env-var toggle (kept for backward compat; defaults to True now)
+_USE_NKI_DELTA_RULE = (
+    _NKI_AVAILABLE
+    and os.environ.get("QWEN35_USE_NKI_DELTA_RULE", "1") != "0"
+)
 
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
@@ -640,8 +643,9 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
                     query, key, value, g=g, beta=beta, initial_state=initial_state
                 )
             else:
-                core_attn_out, new_recurrent_state = recurrent_gated_delta_rule(
-                    query, key, value, g=g, beta=beta, initial_state=initial_state
+                raise RuntimeError(
+                    f"NKI kernel required for TKG at batch>4 but not available! "
+                    f"_USE_NKI={_USE_NKI_DELTA_RULE}, _AVAILABLE={_NKI_AVAILABLE}"
                 )
 
         if seq_ids is not None:
