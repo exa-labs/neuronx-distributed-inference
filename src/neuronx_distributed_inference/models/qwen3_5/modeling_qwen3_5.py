@@ -635,9 +635,14 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
             initial_state = self.recurrent_state[seq_ids].reshape(
                 batch_size, -1, self.head_k_dim, self.head_v_dim
             )
-            core_attn_out, new_recurrent_state = recurrent_gated_delta_rule(
-                query, key, value, g=g, beta=beta, initial_state=initial_state
-            )
+            if _USE_NKI_DELTA_RULE and _NKI_AVAILABLE:
+                core_attn_out, new_recurrent_state = nki_gated_delta_rule(
+                    query, key, value, g=g, beta=beta, initial_state=initial_state
+                )
+            else:
+                core_attn_out, new_recurrent_state = recurrent_gated_delta_rule(
+                    query, key, value, g=g, beta=beta, initial_state=initial_state
+                )
 
         if seq_ids is not None:
             self.next_conv_state = self.conv_state.index_copy(0, seq_ids, new_conv_state)
