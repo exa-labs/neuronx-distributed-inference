@@ -1149,21 +1149,22 @@ class NeuronQwen3_5ForCausalLM(NeuronBaseForCausalLM):
         super().enable_token_generation(**model_init_kwargs)
 
     def get_compiler_args(self):
-        # Force -O1 for both CTE and TKG.  The DeltaNet recurrent layers produce
-        # a graph that neuronx-cc's PGTiling pass (NCC_IPCC901) can't handle at
-        # -O2 (the default for TKG).  -O1 uses Modular flow which sidesteps the
-        # PGTiling crash at the cost of slightly higher function-call overhead.
-        #
-        # CTE uses cc-pipeline-tiling-factor=2 for compute-communication overlap.
-        # TKG must use tiling-factor=1: DeltaNet's recurrent state propagation at
-        # batch=14 triggers the PGTiling assertion (NCC_IPCC901) even at -O1 when
-        # tiling > 1.
         is_tkg = getattr(self, "compile_tag", None) == TOKEN_GENERATION_MODEL_TAG
-        tiling_factor = 1 if is_tkg else 2
+        if is_tkg:
+            # TKG: DeltaNet's recurrent scan DAG triggers PGTiling (NCC_IPCC901)
+            # when --enable-ccop-compute-overlap is set — PGTiling can't partition
+            # the recurrence at batch=14.  Omit ccop entirely for TKG; at seq=1
+            # per step there's negligible communication to overlap anyway.
+            return (
+                "--auto-cast=none --model-type=transformer "
+                f"--lnc={self.neuron_config.logical_nc_config} -O1"
+            )
+        # CTE: use ccop overlap with tiling-factor=2 for compute-communication
+        # pipelining during long prefill passes.
         return (
             "--auto-cast=none --model-type=transformer "
             "--tensorizer-options='--enable-ccop-compute-overlap "
-            f"--cc-pipeline-tiling-factor={tiling_factor} --vectorize-strided-dma ' "
+            "--cc-pipeline-tiling-factor=2 --vectorize-strided-dma ' "
             f"--lnc={self.neuron_config.logical_nc_config} -O1"
         )
 
