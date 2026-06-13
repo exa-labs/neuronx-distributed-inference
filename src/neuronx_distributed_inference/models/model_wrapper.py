@@ -158,7 +158,7 @@ class ModelWrapper(torch.nn.Module):
 
         if hlo2tensorizer:
             self.compiler_args += f" --internal-hlo2tensorizer-options='{hlo2tensorizer} --verify-hlo=true' "
-        else:
+        elif "--internal-hlo2tensorizer-options" not in self.compiler_args:
             self.compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true' "
 
         if self.neuron_config.enable_output_completion_notifications:

@@ -1150,25 +1150,26 @@ class NeuronQwen3_5ForCausalLM(NeuronBaseForCausalLM):
 
     def get_compiler_args(self):
         is_tkg = getattr(self, "compile_tag", None) == TOKEN_GENERATION_MODEL_TAG
+        # DeltaNet's recurrent scan DAG triggers PGTiling (NCC_IPCC901) at
+        # batch=14.  Force aggressive modular-flow partitioning (mac-threshold=10)
+        # so the graph is split into small modules where no single module has the
+        # problematic multi-axis DAG configuration that PGTiling rejects.
+        # NOTE: we include --verify-hlo=true here because model_wrapper skips its
+        # own --internal-hlo2tensorizer-options when we already provide one.
+        hlo2t = "--internal-hlo2tensorizer-options='--modular-flow-mac-threshold=10 --verify-hlo=true'"
         if is_tkg:
-            # TKG: DeltaNet's recurrent scan DAG triggers PGTiling (NCC_IPCC901)
-            # at batch=14 regardless of tensorizer-options.  Force aggressive
-            # modular-flow partitioning (mac-threshold=10) so the graph is split
-            # into small modules where no single module has the problematic
-            # multi-axis DAG configuration that PGTiling rejects.
             return (
                 "--auto-cast=none --model-type=transformer "
-                "--internal-hlo2tensorizer-options='--modular-flow-mac-threshold=10' "
+                f"{hlo2t} "
                 f"--lnc={self.neuron_config.logical_nc_config} -O1"
             )
         # CTE: use ccop overlap with tiling-factor=2 for compute-communication
-        # pipelining during long prefill passes, plus modular-flow for the large
-        # recurrent graph.
+        # pipelining during long prefill passes.
         return (
             "--auto-cast=none --model-type=transformer "
             "--tensorizer-options='--enable-ccop-compute-overlap "
             "--cc-pipeline-tiling-factor=2 --vectorize-strided-dma ' "
-            "--internal-hlo2tensorizer-options='--modular-flow-mac-threshold=10' "
+            f"{hlo2t} "
             f"--lnc={self.neuron_config.logical_nc_config} -O1"
         )
 
