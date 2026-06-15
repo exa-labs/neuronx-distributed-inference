@@ -717,10 +717,17 @@ class NeuronQwen3_5Attention(nn.Module):
 
         dtype = config.neuron_config.torch_dtype
 
+        # DIAGNOSTIC (temporary, env-gated): drop the Qwen3.5 sigmoid output gate
+        # and its fused projection channels to test whether that structure (not
+        # head_dim=256) is what trips neuronx-cc PGTiling at decode batch>8.
+        # Unset by default so the HF-equivalence CPU unit test is unaffected.
+        self.ablate_gate = os.environ.get("QWEN35_ABLATE_GATE") == "1"
+        q_proj_mult = 1 if self.ablate_gate else 2
+
         # q_proj emits query and output-gate channels, interleaved per head.
         self.q_proj = ColumnParallelLinear(
             self.hidden_size,
-            self.num_heads * self.head_dim * 2,
+            self.num_heads * self.head_dim * q_proj_mult,
             bias=attention_bias,
             gather_output=False,
             dtype=dtype,
@@ -773,10 +780,16 @@ class NeuronQwen3_5Attention(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
 
         q = self.q_proj(hidden_states)
-        q = q.view(batch_size, seq_len, self.local_num_heads, self.head_dim * 2)
-        query_states = q[..., : self.head_dim]
-        gate = q[..., self.head_dim:]
-        gate = gate.reshape(batch_size, seq_len, -1)
+        if self.ablate_gate:
+            query_states = q.view(
+                batch_size, seq_len, self.local_num_heads, self.head_dim
+            )
+            gate = None
+        else:
+            q = q.view(batch_size, seq_len, self.local_num_heads, self.head_dim * 2)
+            query_states = q[..., : self.head_dim]
+            gate = q[..., self.head_dim:]
+            gate = gate.reshape(batch_size, seq_len, -1)
 
         key_states = self.k_proj(hidden_states).view(
             batch_size, seq_len, self.local_num_kv_heads, self.head_dim
@@ -846,7 +859,8 @@ class NeuronQwen3_5Attention(nn.Module):
             attn_output = softmax_prior @ v_cache + softmax_active @ v_new
 
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
-        attn_output = attn_output * torch.sigmoid(gate)
+        if gate is not None:
+            attn_output = attn_output * torch.sigmoid(gate)
         attn_output = self.o_proj(attn_output)
 
         return attn_output, present_key_value
