@@ -315,9 +315,10 @@ def chunk_gated_delta_rule(
         chunk_outs.append(attn_inter + attn @ v_new)
         g_last = g[:, i, -1, None, None].exp()
         k_decay = k_i * (g[:, i, -1, None] - g[:, i]).exp()[..., None]
-        state_update = last_recurrent_state * 0
-        for c in range(chunk_size):
-            state_update = state_update + k_decay[:, c, :, None] * v_new[:, c, None, :]
+        # state_update = sum_c outer(k_decay[:, c], v_new[:, c]) == k_decay^T @ v_new;
+        # the matmul form keeps the graph small (one dense op vs chunk_size unrolled
+        # rank-1 updates) so neuronx-cc compiles fast and tiles it cleanly.
+        state_update = k_decay.transpose(-1, -2) @ v_new
         last_recurrent_state = last_recurrent_state * g_last + state_update
 
     core_attn_out = torch.cat(chunk_outs, dim=-2)
