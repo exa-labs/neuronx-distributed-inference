@@ -65,6 +65,16 @@ _USE_NKI_DELTA_RULE = (
 # matching the pure-attention structure that PGTiling can tile.
 _DELTANET_REPLICATED = os.environ.get("QWEN35_DELTANET_REPLICATED") == "1"
 
+# Shard only the *prefill* (context-encoding) DeltaNet recurrence across ranks
+# while keeping the projections replicated.  Replication clears the decode
+# PGTiling wall but unshards the recurrent scan, so prefill pays a ~4x compute
+# tax (22s vs ~6s at tp=4).  With this flag the expensive recurrence runs on a
+# per-rank head slice and the result is all-gathered before the (replicated)
+# out_proj -- recovering the sharded prefill speed -- while the decode graph
+# stays collective-free (full recurrence on every rank), so the wall remains
+# cleared.  Only meaningful together with QWEN35_DELTANET_REPLICATED=1.
+_DELTANET_SHARD_PREFILL = os.environ.get("QWEN35_DELTANET_SHARD_PREFILL") == "1"
+
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
@@ -72,6 +82,7 @@ from neuronx_distributed.parallel_layers.layers import (
     RowParallelLinear,
     SPMDRank,
 )
+from neuronx_distributed.parallel_layers.mappings import _gather_along_dim
 
 from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
 from neuronx_distributed_inference.models.model_base import (
@@ -453,6 +464,17 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
         self.local_num_k_heads = self.num_k_heads // shard_degree
         self.local_num_v_heads = self.num_v_heads // shard_degree
 
+        # Prefill-only recurrence sharding (requires replicated projections).
+        # The per-rank value-head count for the context-encoding recurrence;
+        # equals the global count unless prefill sharding is enabled.
+        self.shard_prefill = _DELTANET_SHARD_PREFILL and self.replicated
+        self.cte_shard_degree = tp_degree if self.shard_prefill else 1
+        assert self.num_v_heads % self.cte_shard_degree == 0, (
+            f"linear_num_value_heads ({self.num_v_heads}) must be divisible by "
+            f"cte_shard_degree ({self.cte_shard_degree})"
+        )
+        self.cte_local_num_v_heads = self.num_v_heads // self.cte_shard_degree
+
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.local_key_dim = self.key_dim // shard_degree
@@ -652,7 +674,40 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
             query = query.repeat_interleave(self.local_num_v_heads // self.local_num_k_heads, dim=2)
             key = key.repeat_interleave(self.local_num_v_heads // self.local_num_k_heads, dim=2)
 
-        if is_for_context_encoding:
+        if is_for_context_encoding and self.shard_prefill:
+            # CTE with prefill sharding: the recurrent scan is the dominant
+            # prefill cost, so run it on a per-rank value-head slice and
+            # all-gather the slices back to the full head range before the
+            # (replicated) norm/out_proj.  The all-gather is the only
+            # collective and lives solely in this context-encoding graph, so
+            # the decode graph stays collective-free and the PGTiling wall
+            # remains cleared.
+            h = self.cte_local_num_v_heads
+            prefill_rank = self.rank_util.get_rank().to(torch.long)
+            hidx = prefill_rank * h + torch.arange(h, device=query.device)
+            q_local = query.index_select(2, hidx)
+            k_local = key.index_select(2, hidx)
+            v_local = value.index_select(2, hidx)
+            g_local = g.index_select(2, hidx)
+            beta_local = beta.index_select(2, hidx)
+            initial_state = torch.zeros(
+                batch_size, h, self.head_k_dim, self.head_v_dim,
+                dtype=torch.float32, device=query.device,
+            )
+            if _USE_NKI_DELTA_RULE and _NKI_AVAILABLE:
+                core_local, rstate_local = nki_gated_delta_rule(
+                    q_local, k_local, v_local, g=g_local, beta=beta_local,
+                    initial_state=initial_state,
+                )
+            else:
+                core_local, rstate_local = recurrent_gated_delta_rule(
+                    q_local, k_local, v_local, g=g_local, beta=beta_local,
+                    initial_state=initial_state,
+                )
+            # core_local: [B, S, h, head_v]; rstate_local: [B, h, head_k, head_v]
+            core_attn_out = _gather_along_dim(core_local, partition_dim=2)
+            new_recurrent_state = _gather_along_dim(rstate_local, partition_dim=1)
+        elif is_for_context_encoding:
             # CTE (context encoding) for DeltaNet layers.
             # The chunked-parallel form triggers neuronx-cc PGTiling
             # (NCC_IPCC901) at ANY seq_len >= chunk_size. Two alternatives:
