@@ -55,6 +55,16 @@ _USE_NKI_DELTA_RULE = (
     and os.environ.get("QWEN35_USE_NKI_DELTA_RULE", "1") != "0"
 )
 
+# Replicate the DeltaNet projections across tensor-parallel ranks instead of
+# sharding them.  The hybrid token-generation graph fails neuronx-cc PGTiling
+# (NCC_IPCC901) at decode batch>8 because the DeltaNet RowParallel out_proj
+# all-reduce and the full-attention o_proj all-reduce land in the same DAG with
+# incompatible axis groups.  A pure full-attention model (no DeltaNet) compiles
+# at batch=14.  Running the DeltaNet layers replicated (no collectives) leaves
+# the full-attention all-reduces as the only collectives in the decode DAG,
+# matching the pure-attention structure that PGTiling can tile.
+_DELTANET_REPLICATED = os.environ.get("QWEN35_DELTANET_REPLICATED") == "1"
+
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
@@ -431,45 +441,65 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
         self.layer_norm_epsilon = config.rms_norm_eps
 
         tp_degree = _get_tp_degree()
-        assert self.num_k_heads % tp_degree == 0, (
+        # When replicating the DeltaNet across ranks, the per-rank ("local")
+        # head/channel counts equal the global counts: every rank holds the
+        # full projections and runs the full recurrence with no collectives.
+        self.replicated = _DELTANET_REPLICATED
+        shard_degree = 1 if self.replicated else tp_degree
+        assert self.num_k_heads % shard_degree == 0, (
             f"linear_num_key_heads ({self.num_k_heads}) must be divisible by "
-            f"tp_degree ({tp_degree})"
+            f"shard_degree ({shard_degree})"
         )
-        self.local_num_k_heads = self.num_k_heads // tp_degree
-        self.local_num_v_heads = self.num_v_heads // tp_degree
+        self.local_num_k_heads = self.num_k_heads // shard_degree
+        self.local_num_v_heads = self.num_v_heads // shard_degree
 
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
-        self.local_key_dim = self.key_dim // tp_degree
-        self.local_value_dim = self.value_dim // tp_degree
+        self.local_key_dim = self.key_dim // shard_degree
+        self.local_value_dim = self.value_dim // shard_degree
         self.local_conv_dim = self.local_key_dim * 2 + self.local_value_dim
 
         dtype = config.neuron_config.torch_dtype
 
-        # Projections. Shard along the head dimension; the per-key-head
-        # interleaved layout of in_proj_qkvz/in_proj_ba is preserved by the
-        # weight conversion (see convert_qwen3_5_hf_to_neuron_state_dict).
-        self.in_proj_qkvz = ColumnParallelLinear(
-            self.hidden_size,
-            self.key_dim * 2 + self.value_dim * 2,
-            bias=False,
-            gather_output=False,
-            dtype=dtype,
-        )
-        self.in_proj_ba = ColumnParallelLinear(
-            self.hidden_size,
-            self.num_v_heads * 2,
-            bias=False,
-            gather_output=False,
-            dtype=dtype,
-        )
-        self.out_proj = RowParallelLinear(
-            self.value_dim,
-            self.hidden_size,
-            bias=False,
-            input_is_parallel=True,
-            dtype=dtype,
-        )
+        # Projections. Sharded along the head dimension by default; the
+        # per-key-head interleaved layout of in_proj_qkvz/in_proj_ba is
+        # preserved by the weight conversion (see
+        # convert_qwen3_5_hf_to_neuron_state_dict).  In replicated mode they are
+        # plain nn.Linear so NxD's checkpoint sharder leaves them full-size on
+        # every rank and they emit no tensor-parallel collectives.
+        if self.replicated:
+            self.in_proj_qkvz = nn.Linear(
+                self.hidden_size, self.key_dim * 2 + self.value_dim * 2,
+                bias=False, dtype=dtype,
+            )
+            self.in_proj_ba = nn.Linear(
+                self.hidden_size, self.num_v_heads * 2, bias=False, dtype=dtype,
+            )
+            self.out_proj = nn.Linear(
+                self.value_dim, self.hidden_size, bias=False, dtype=dtype,
+            )
+        else:
+            self.in_proj_qkvz = ColumnParallelLinear(
+                self.hidden_size,
+                self.key_dim * 2 + self.value_dim * 2,
+                bias=False,
+                gather_output=False,
+                dtype=dtype,
+            )
+            self.in_proj_ba = ColumnParallelLinear(
+                self.hidden_size,
+                self.num_v_heads * 2,
+                bias=False,
+                gather_output=False,
+                dtype=dtype,
+            )
+            self.out_proj = RowParallelLinear(
+                self.value_dim,
+                self.hidden_size,
+                bias=False,
+                input_is_parallel=True,
+                dtype=dtype,
+            )
 
         # Depthwise causal conv plus the per-head dt_bias / A_log gates.
         # NxD's checkpoint sharder only shards parameters owned by parallel
@@ -559,7 +589,12 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
 
         # Local slices of the replicated conv / per-head parameters
         # (conv channels are stored in per-rank slabs; see weight conversion).
-        rank = self.rank_util.get_rank().to(torch.long)
+        # In replicated mode the local dims equal the global dims, so every
+        # rank owns the full conv/head ranges (slice from offset 0).
+        if self.replicated:
+            rank = torch.zeros((), dtype=torch.long, device=hidden_states.device)
+        else:
+            rank = self.rank_util.get_rank().to(torch.long)
         conv_idx = rank * self.local_conv_dim + torch.arange(
             self.local_conv_dim, device=hidden_states.device
         )
@@ -1090,7 +1125,9 @@ def convert_qwen3_5_hf_to_neuron_state_dict(state_dict: dict, config: InferenceC
         state_dict[f"layers.{l}.linear_attn.rank_util.rank"] = torch.arange(
             0, tp, dtype=torch.int32
         )
-        if tp == 1:
+        # Replicated DeltaNet keeps the full HF conv layout on every rank (no
+        # per-rank slabs), so skip the reorder exactly as for tp == 1.
+        if tp == 1 or _DELTANET_REPLICATED:
             continue
         w = state_dict[key]
         q, k, v = torch.split(w, [key_dim, key_dim, value_dim], dim=0)
