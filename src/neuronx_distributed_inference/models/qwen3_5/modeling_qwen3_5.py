@@ -88,6 +88,20 @@ _DELTANET_SHARD_PREFILL = os.environ.get("QWEN35_DELTANET_SHARD_PREFILL") == "1"
 # XLA trace entirely.
 _DELTANET_CHUNK_PREFILL = os.environ.get("QWEN35_DELTANET_CHUNK_PREFILL", "")
 
+# Fully shard the DeltaNet projections across ranks (in_proj ColumnParallel) in
+# BOTH prefill and decode, but drive the output through an all-gather of the
+# core attention output followed by a *replicated* out_proj -- instead of the
+# RowParallelLinear out_proj whose all-reduce trips the decode PGTiling wall.
+# This is the principled decode lever: in replicated/shard-prefill mode every
+# rank stores and reads the full ~1B DeltaNet projection weights, which dominate
+# the memory-bandwidth-bound decode at tp>=4; sharding in_proj cuts the per-rank
+# DeltaNet weight/HBM traffic by tp.  The all-gather is the same collective the
+# shard-prefill path already places in the CTE DAG alongside the full-attention
+# all-reduce (which compiles clean at seqs=14), so extending it to the decode
+# DAG -- replacing the incompatible second all-reduce -- is expected to tile.
+# Implies non-replicated projections; set QWEN35_DELTANET_REPLICATED=0 with it.
+_DELTANET_SHARD_DECODE = os.environ.get("QWEN35_DELTANET_SHARD_DECODE") == "1"
+
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
@@ -507,7 +521,11 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
         # When replicating the DeltaNet across ranks, the per-rank ("local")
         # head/channel counts equal the global counts: every rank holds the
         # full projections and runs the full recurrence with no collectives.
-        self.replicated = _DELTANET_REPLICATED
+        # shard_decode fully shards in_proj (ColumnParallel) but routes the
+        # output through an all-gather + replicated out_proj, so it is mutually
+        # exclusive with the replicated layout (it implies non-replicated).
+        self.shard_decode = _DELTANET_SHARD_DECODE
+        self.replicated = _DELTANET_REPLICATED and not self.shard_decode
         shard_degree = 1 if self.replicated else tp_degree
         assert self.num_k_heads % shard_degree == 0, (
             f"linear_num_key_heads ({self.num_k_heads}) must be divisible by "
@@ -567,13 +585,22 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
                 gather_output=False,
                 dtype=dtype,
             )
-            self.out_proj = RowParallelLinear(
-                self.value_dim,
-                self.hidden_size,
-                bias=False,
-                input_is_parallel=True,
-                dtype=dtype,
-            )
+            if self.shard_decode:
+                # in_proj is sharded (ColumnParallel) but the per-rank core
+                # attention output is all-gathered to the full value_dim before
+                # out_proj, so out_proj is a *replicated* nn.Linear over the full
+                # value_dim (no RowParallel all-reduce -> no decode PGTiling wall).
+                self.out_proj = nn.Linear(
+                    self.value_dim, self.hidden_size, bias=False, dtype=dtype,
+                )
+            else:
+                self.out_proj = RowParallelLinear(
+                    self.value_dim,
+                    self.hidden_size,
+                    bias=False,
+                    input_is_parallel=True,
+                    dtype=dtype,
+                )
 
         # Depthwise causal conv plus the per-head dt_bias / A_log gates.
         # NxD's checkpoint sharder only shards parameters owned by parallel
@@ -795,6 +822,14 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
+        if self.shard_decode:
+            # core_attn_out is [B, S, local_num_v_heads, head_v]; gather the
+            # per-rank value-head slices into the full head dimension so the
+            # replicated out_proj sees the full value_dim.  This all-gather
+            # replaces the RowParallel out_proj all-reduce in *both* the prefill
+            # and decode graphs -- the same collective the shard-prefill path
+            # already places in the CTE graph without tripping PGTiling.
+            core_attn_out = _gather_along_dim(core_attn_out, partition_dim=2)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
         return self.out_proj(core_attn_out)
