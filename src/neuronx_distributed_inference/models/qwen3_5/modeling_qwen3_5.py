@@ -75,6 +75,19 @@ _DELTANET_REPLICATED = os.environ.get("QWEN35_DELTANET_REPLICATED") == "1"
 # cleared.  Only meaningful together with QWEN35_DELTANET_REPLICATED=1.
 _DELTANET_SHARD_PREFILL = os.environ.get("QWEN35_DELTANET_SHARD_PREFILL") == "1"
 
+# Use the chunk-parallel form of the gated delta rule for prefill instead of the
+# token-sequential recurrence.  The recurrence is O(seq_len) sequential steps and
+# dominates prefill latency (~6s sharded / ~22s replicated for 7500 tokens).  The
+# chunked form does O(seq_len / chunk) sequential chunk-steps, each a batch of
+# dense matmuls, collapsing prefill toward parallel-attention cost.  The pure
+# torch chunked form previously tripped neuronx-cc PGTiling, but that was in the
+# RowParallel (out_proj all-reduce) layout; under QWEN35_DELTANET_SHARD_PREFILL
+# the DeltaNet compute is collective-free (only benign all-gathers remain), so it
+# is worth re-evaluating.  "torch" runs chunk_gated_delta_rule (let neuronx-cc
+# compile it); "nki" runs the hand-written chunked NKI kernel that bypasses the
+# XLA trace entirely.
+_DELTANET_CHUNK_PREFILL = os.environ.get("QWEN35_DELTANET_CHUNK_PREFILL", "")
+
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
@@ -426,6 +439,37 @@ def nki_gated_delta_rule(
     return core_attn_out, final_state
 
 
+def _prefill_gated_delta_rule(query, key, value, g, beta, initial_state):
+    """Dispatch the prefill (context-encoding) gated delta rule.
+
+    Selection (env ``QWEN35_DELTANET_CHUNK_PREFILL``):
+      ``"torch"`` -> ``chunk_gated_delta_rule`` (chunk-parallel, XLA-traced and
+        compiled by neuronx-cc).
+      ``"nki"``   -> ``nki_chunk_gated_delta_rule`` (chunk-parallel hand-written
+        NKI kernel, bypasses the XLA trace / PGTiling).
+    Otherwise the token-sequential recurrence is used: the NKI recurrent kernel
+    when available, else the pure-torch reference.
+
+    All implementations share the interface ``(query,key,value,g,beta,
+    initial_state) -> (core_attn_out [B,S,H,Dv], final_state [B,H,Dk,Dv])``.
+    """
+    if _DELTANET_CHUNK_PREFILL == "torch":
+        return chunk_gated_delta_rule(
+            query, key, value, g=g, beta=beta, initial_state=initial_state
+        )
+    if _DELTANET_CHUNK_PREFILL == "nki" and _NKI_AVAILABLE:
+        return nki_chunk_gated_delta_rule(
+            query, key, value, g=g, beta=beta, initial_state=initial_state
+        )
+    if _USE_NKI_DELTA_RULE and _NKI_AVAILABLE:
+        return nki_gated_delta_rule(
+            query, key, value, g=g, beta=beta, initial_state=initial_state
+        )
+    return recurrent_gated_delta_rule(
+        query, key, value, g=g, beta=beta, initial_state=initial_state
+    )
+
+
 class NeuronQwen3_5GatedDeltaNet(nn.Module):
     """Gated DeltaNet linear-attention mixer with per-sequence on-module state.
 
@@ -694,37 +738,25 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
                 batch_size, h, self.head_k_dim, self.head_v_dim,
                 dtype=torch.float32, device=query.device,
             )
-            if _USE_NKI_DELTA_RULE and _NKI_AVAILABLE:
-                core_local, rstate_local = nki_gated_delta_rule(
-                    q_local, k_local, v_local, g=g_local, beta=beta_local,
-                    initial_state=initial_state,
-                )
-            else:
-                core_local, rstate_local = recurrent_gated_delta_rule(
-                    q_local, k_local, v_local, g=g_local, beta=beta_local,
-                    initial_state=initial_state,
-                )
+            core_local, rstate_local = _prefill_gated_delta_rule(
+                q_local, k_local, v_local, g=g_local, beta=beta_local,
+                initial_state=initial_state,
+            )
             # core_local: [B, S, h, head_v]; rstate_local: [B, h, head_k, head_v]
             core_attn_out = _gather_along_dim(core_local, partition_dim=2)
             new_recurrent_state = _gather_along_dim(rstate_local, partition_dim=1)
         elif is_for_context_encoding:
-            # CTE (context encoding) for DeltaNet layers.
-            # The chunked-parallel form triggers neuronx-cc PGTiling
-            # (NCC_IPCC901) at ANY seq_len >= chunk_size. Two alternatives:
-            # - NKI kernel: custom tiled kernel bypasses XLA/neuronx-cc entirely
-            # - Recurrent form: simple sequential chain the compiler can handle
+            # CTE (context encoding) for DeltaNet layers.  The implementation is
+            # selected by _prefill_gated_delta_rule: chunk-parallel (torch or
+            # NKI) when QWEN35_DELTANET_CHUNK_PREFILL is set, else the
+            # token-sequential recurrence (NKI kernel / torch reference).
             initial_state = torch.zeros(
                 batch_size, query.shape[2], self.head_k_dim, self.head_v_dim,
                 dtype=torch.float32, device=query.device,
             )
-            if _USE_NKI_DELTA_RULE and _NKI_AVAILABLE:
-                core_attn_out, new_recurrent_state = nki_gated_delta_rule(
-                    query, key, value, g=g, beta=beta, initial_state=initial_state
-                )
-            else:
-                core_attn_out, new_recurrent_state = recurrent_gated_delta_rule(
-                    query, key, value, g=g, beta=beta, initial_state=initial_state
-                )
+            core_attn_out, new_recurrent_state = _prefill_gated_delta_rule(
+                query, key, value, g=g, beta=beta, initial_state=initial_state
+            )
         else:
             initial_state = self.recurrent_state[seq_ids].reshape(
                 batch_size, -1, self.head_k_dim, self.head_v_dim
