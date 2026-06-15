@@ -74,6 +74,7 @@ from neuronx_distributed_inference.models.model_wrapper import (
     DecoderModelInstance,
     ModelWrapper,
 )
+from neuronx_distributed_inference.modules.attention.utils import manual_softmax
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 
 
@@ -815,23 +816,34 @@ class NeuronQwen3_5Attention(nn.Module):
             probs = F.softmax(scores.float(), dim=-1).to(scores.dtype)
             attn_output = probs @ v_full
         else:
-            # Token generation: attend over the cache (masked by
-            # attention_mask) plus the current token (masked by active_mask).
+            # Token generation: attend over the cache (masked by attention_mask)
+            # plus the current token (masked by active_mask). Mirror
+            # NeuronAttentionBase.compute_for_token_gen: split the softmax over
+            # the prior (cached) and active (new) KV via manual_softmax instead
+            # of concatenating the score tensors. The concat path materialises a
+            # single (B, H, q, prior+active) DAG whose tensor-parallel axes
+            # neuronx-cc's PGTiling pass cannot tile at batch > 8, which is the
+            # AWS-supported attention's decode structure and the reason Qwen3
+            # compiles at higher concurrency.
             k_cache, v_cache = past_key_value
             k_cache, v_cache = _expand_kv(k_cache, v_cache)
             k_new, v_new = _expand_kv(key_states, value_states)
             scores_prior = query_states @ k_cache.transpose(-1, -2) / (self.head_dim ** 0.5)
             scores_prior = torch.where(
                 attention_mask, scores_prior, torch.finfo(scores_prior.dtype).min
-            )
+            ).float()
             scores_active = query_states @ k_new.transpose(-1, -2) / (self.head_dim ** 0.5)
             if active_mask is not None:
                 scores_active = torch.where(
                     active_mask, scores_active, torch.finfo(scores_active.dtype).min
                 )
-            scores = torch.cat([scores_prior, scores_active], dim=-1)
-            probs = F.softmax(scores.float(), dim=-1).to(scores.dtype)
-            attn_output = probs @ torch.cat([v_cache, v_new], dim=2)
+            scores_active = scores_active.float()
+            softmax_prior, softmax_active = manual_softmax(
+                scores_prior, scores_active, False
+            )
+            softmax_prior = softmax_prior.to(query_states.dtype)
+            softmax_active = softmax_active.to(query_states.dtype)
+            attn_output = softmax_prior @ v_cache + softmax_active @ v_new
 
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
         attn_output = attn_output * torch.sigmoid(gate)
