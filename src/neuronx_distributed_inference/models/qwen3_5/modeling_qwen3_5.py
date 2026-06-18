@@ -102,6 +102,19 @@ _DELTANET_CHUNK_PREFILL = os.environ.get("QWEN35_DELTANET_CHUNK_PREFILL", "")
 # Implies non-replicated projections; set QWEN35_DELTANET_REPLICATED=0 with it.
 _DELTANET_SHARD_DECODE = os.environ.get("QWEN35_DELTANET_SHARD_DECODE") == "1"
 
+# Within-chunk DeltaNet *prefill* state update in chunk_gated_delta_rule.  The
+# increment ``sum_c outer(k_decay[c], v_new[c]) == k_decay^T @ v_new`` is a
+# batched transposed matmul.  The HF reference uses the matmul, but the bare
+# matmul crashes neuronx-cc TensorEngine codegen (NCC_INLA001) on the flattened
+# [bh, chunk, D] shape, so the default "loop" keeps the unrolled rank-1
+# accumulation that always lowers.  That loop is ``chunk_size`` sequential steps
+# per chunk, so its depth scales with sequence length and dominates single-chip
+# (tp2) prefill latency -- the matmul/einsum forms collapse it to one dense op.
+# All variants are bit-near-exact (CPU rel-err ~1e-7); this selector lets one
+# image build A/B the lowerings on hardware.  Values: "loop" (default, safe),
+# "matmul", "matmul_contig", "einsum", "bmm".
+_DELTANET_STATE_UPDATE = os.environ.get("QWEN35_DELTANET_STATE_UPDATE", "loop")
+
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
@@ -240,6 +253,37 @@ def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     return x * inv_norm
 
 
+def _within_chunk_state_update(
+    k_decay: torch.Tensor, v_new: torch.Tensor, chunk_size: int
+) -> torch.Tensor:
+    """Within-chunk DeltaNet state increment ``sum_c outer(k_decay[:, c], v_new[:, c])``.
+
+    Equivalent to the batched transposed matmul ``k_decay^T @ v_new`` producing
+    ``[bh, Dk, Dv]``.  ``k_decay``/``v_new`` are the i-th chunk tensors shaped
+    ``[bh, chunk_size, D]``.  The formulation is env-selectable
+    (``QWEN35_DELTANET_STATE_UPDATE``): the bare matmul matches the HF reference
+    and collapses the update to one dense op, but crashes neuronx-cc on some
+    toolchains (NCC_INLA001); the "loop" fallback always lowers but serialises
+    ``chunk_size`` rank-1 updates per chunk (the single-chip prefill bottleneck).
+    All variants are bit-near-exact.
+    """
+    if _DELTANET_STATE_UPDATE == "matmul":
+        return k_decay.transpose(-1, -2) @ v_new
+    if _DELTANET_STATE_UPDATE == "matmul_contig":
+        return k_decay.transpose(-1, -2).contiguous() @ v_new.contiguous()
+    if _DELTANET_STATE_UPDATE == "einsum":
+        return torch.einsum("bck,bcv->bkv", k_decay, v_new)
+    if _DELTANET_STATE_UPDATE == "bmm":
+        return torch.bmm(k_decay.transpose(1, 2).contiguous(), v_new.contiguous())
+    # default "loop": unrolled rank-1 accumulation -- always lowers cleanly.
+    state_update = k_decay.new_zeros(
+        k_decay.shape[0], k_decay.shape[-1], v_new.shape[-1]
+    )
+    for c in range(chunk_size):
+        state_update = state_update + k_decay[:, c, :, None] * v_new[:, c, None, :]
+    return state_update
+
+
 def chunk_gated_delta_rule(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -329,17 +373,7 @@ def chunk_gated_delta_rule(
         chunk_outs.append(attn_inter + attn @ v_new)
         g_last = g[:, i, -1, None, None].exp()
         k_decay = k_i * (g[:, i, -1, None] - g[:, i]).exp()[..., None]
-        # state_update = sum_c outer(k_decay[:, c], v_new[:, c]).  The compact
-        # matmul form (k_decay.transpose(-1, -2) @ v_new) is algebraically
-        # identical and CPU-verified bit-near-exact, but neuronx-cc crashes on it
-        # in TensorEngine codegen (NCC_INLA001 assignStaticPattern<TPB_TENSOR2D>
-        # at generator.h:417) -- a compiler bug for this batched transposed-matmul
-        # shape, outside our control.  WONTFIX: keep the unrolled rank-1
-        # accumulation, which lowers cleanly.  This is prefill-only and not on the
-        # throughput-critical path, so the larger HLO only costs compile time.
-        state_update = last_recurrent_state * 0
-        for c in range(chunk_size):
-            state_update = state_update + k_decay[:, c, :, None] * v_new[:, c, None, :]
+        state_update = _within_chunk_state_update(k_decay, v_new, chunk_size)
         last_recurrent_state = last_recurrent_state * g_last + state_update
 
     core_attn_out = torch.cat(chunk_outs, dim=-2)
