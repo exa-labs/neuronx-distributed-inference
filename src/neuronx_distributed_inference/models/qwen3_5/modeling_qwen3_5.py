@@ -282,6 +282,28 @@ def _within_chunk_state_update(
         # multiply + reduce_sum -- a different HLO that may compile while
         # remaining bit-near-exact and collapsing the chunk loop to one op.
         return (k_decay.unsqueeze(-1) * v_new.unsqueeze(-2)).sum(dim=1)
+    if _DELTANET_STATE_UPDATE in ("matmul_tiled", "outer_tiled"):
+        # The matmul/einsum/bmm/outer_sum forms all crash neuronx-cc (NCC_INLA001
+        # TPB_TENSOR2D) producing the full [bh, Dk, Dv] = [bh, 128, 128] state
+        # tile by contracting the 64-chunk dim.  Split the Dv (free) output dim
+        # so each contraction emits a narrower [bh, Dk, Dv/n] tile, which may
+        # dodge the static-pattern assignment while still collapsing the 64-step
+        # loop into a handful of dense ops.  Math is identical (column split of
+        # the same product), so this stays bit-near-exact.
+        n_tiles = 2
+        dv = v_new.shape[-1]
+        step = (dv + n_tiles - 1) // n_tiles
+        tiles = []
+        if _DELTANET_STATE_UPDATE == "matmul_tiled":
+            k_t = k_decay.transpose(-1, -2)  # [bh, Dk, chunk]
+            for start in range(0, dv, step):
+                tiles.append(k_t @ v_new[..., start : start + step])
+        else:
+            k_e = k_decay.unsqueeze(-1)  # [bh, chunk, Dk, 1]
+            for start in range(0, dv, step):
+                v_e = v_new[..., start : start + step].unsqueeze(-2)
+                tiles.append((k_e * v_e).sum(dim=1))
+        return torch.cat(tiles, dim=-1)
     # default "loop": unrolled rank-1 accumulation -- always lowers cleanly.
     state_update = k_decay.new_zeros(
         k_decay.shape[0], k_decay.shape[-1], v_new.shape[-1]
