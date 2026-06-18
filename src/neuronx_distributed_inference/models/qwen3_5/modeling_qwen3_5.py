@@ -275,6 +275,13 @@ def _within_chunk_state_update(
         return torch.einsum("bck,bcv->bkv", k_decay, v_new)
     if _DELTANET_STATE_UPDATE == "bmm":
         return torch.bmm(k_decay.transpose(1, 2).contiguous(), v_new.contiguous())
+    if _DELTANET_STATE_UPDATE == "outer_sum":
+        # broadcast outer products then reduce over the chunk dim.  Unlike the
+        # matmul/einsum/bmm forms (which all lower to the same transposed dot
+        # that crashes neuronx-cc with NCC_INLA001), this emits a broadcast
+        # multiply + reduce_sum -- a different HLO that may compile while
+        # remaining bit-near-exact and collapsing the chunk loop to one op.
+        return (k_decay.unsqueeze(-1) * v_new.unsqueeze(-2)).sum(dim=1)
     # default "loop": unrolled rank-1 accumulation -- always lowers cleanly.
     state_update = k_decay.new_zeros(
         k_decay.shape[0], k_decay.shape[-1], v_new.shape[-1]
