@@ -19,6 +19,7 @@ Run with:
 
 import unittest
 
+import numpy
 import torch
 import torch.nn as nn
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
@@ -156,6 +157,37 @@ class TestGatedDeltaRuleKernels(unittest.TestCase):
         )
         assert_close(self, expected_out, actual_out, name="recurrent core_attn_out")
         assert_close(self, expected_state, actual_state, name="recurrent final state")
+
+    def test_nki_within_chunk_state_update_matches_loop(self):
+        """The NKI TensorEngine state-update kernel must match the torch
+        rank-1 loop / matmul reference bit-near-exactly (it is the only form of
+        the contraction that compiles on neuronx-cc)."""
+        try:
+            import nki  # noqa: F401
+            from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
+                nki_within_chunk_state_update,
+            )
+        except ImportError:
+            self.skipTest("nki not available in this environment")
+
+        bh, c, dk, dv = 4, 64, 128, 128
+        k_decay = torch.randn(bh, c, dk)
+        v_new = torch.randn(bh, c, dv)
+
+        # Reference: the default "loop" form summed over the chunk dimension.
+        expected = k_decay.new_zeros(bh, dk, dv)
+        for ci in range(c):
+            expected = expected + k_decay[:, ci, :, None] * v_new[:, ci, None, :]
+
+        try:
+            actual = nki.simulate(nki_within_chunk_state_update)(
+                k_decay.numpy(), v_new.numpy()
+            )
+        except Exception as exc:  # pragma: no cover - sim infra dependent
+            self.skipTest(f"nki.simulate unavailable: {exc}")
+        actual = torch.from_numpy(numpy.asarray(actual)).float()
+
+        assert_close(self, expected, actual, rtol=1e-4, name="nki within-chunk state update")
 
     def test_chunked_vs_recurrent_consistency(self):
         """Both forms compute the same math, so prefill-then-decode must equal

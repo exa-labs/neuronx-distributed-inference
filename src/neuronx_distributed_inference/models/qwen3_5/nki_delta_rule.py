@@ -146,3 +146,53 @@ def nki_recurrent_gated_delta_rule(
         nisa.dma_copy(dst=final_state_ref[idx, :, :], src=state)
 
     return out_ref, final_state_ref
+
+
+@nki.jit(mode="torchxla")
+def nki_within_chunk_state_update(k_decay_ref, v_new_ref):
+    """Within-chunk DeltaNet state increment as one TensorEngine matmul per head.
+
+    Computes ``state_update[bh, Dk, Dv] = k_decay^T @ v_new`` over the chunk
+    dimension, i.e. ``sum_c outer(k_decay[:, c], v_new[:, c])``.  This is the
+    increment that ``chunk_gated_delta_rule`` accumulates into the recurrent
+    state once per chunk.
+
+    The XLA-lowered torch forms of this op (matmul / einsum / bmm / broadcast-
+    reduce, tiled or not) all crash neuronx-cc with NCC_INLA001
+    (``assignStaticPattern<TPB_TENSOR2D>``) because the contraction over the
+    64-chunk dim into the [128, 128] state tile trips the static-pattern
+    assignment.  Emitting the contraction directly as ``nisa.nc_matmul`` bypasses
+    that lowering: ``nc_matmul(out[Dk, Dv], A=k_decay[C, Dk], B=v_new[C, Dv])``
+    computes ``A^T @ B`` with the chunk dim ``C`` as the partition/contraction
+    axis (C <= 128), collapsing the default 64-step sequential rank-1 loop into a
+    single dense matmul per (batch*head) slice.
+
+    Args:
+        k_decay_ref: [BH, C, Dk]  per-chunk decayed keys (C = chunk_size <= 128)
+        v_new_ref:   [BH, C, Dv]  per-chunk corrected values
+
+    Returns:
+        out_ref:     [BH, Dk, Dv]  within-chunk state increment (fp32)
+    """
+    bh = k_decay_ref.shape[0]
+    c = k_decay_ref.shape[1]
+    dk = k_decay_ref.shape[2]
+    dv = v_new_ref.shape[2]
+
+    out_ref = nl.ndarray((bh, dk, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    for idx in nl.affine_range(bh):
+        # Load this head's chunk tiles: partition dim = chunk (contraction axis).
+        kd = nl.ndarray((c, dk), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=kd, src=k_decay_ref[idx, :, :])
+        vn = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=vn, src=v_new_ref[idx, :, :])
+
+        # nc_matmul: out[Dk, Dv] = kd[C, Dk]^T @ vn[C, Dv]  (contraction = C).
+        su_psum = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(su_psum, kd, vn)
+        su = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(su, su_psum)
+        nisa.dma_copy(dst=out_ref[idx, :, :], src=su)
+
+    return out_ref

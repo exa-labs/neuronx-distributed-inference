@@ -45,6 +45,7 @@ from torch import nn
 try:
     from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
         nki_recurrent_gated_delta_rule,
+        nki_within_chunk_state_update,
     )
     _NKI_AVAILABLE = True
 except ImportError:
@@ -112,7 +113,11 @@ _DELTANET_SHARD_DECODE = os.environ.get("QWEN35_DELTANET_SHARD_DECODE") == "1"
 # (tp2) prefill latency -- the matmul/einsum forms collapse it to one dense op.
 # All variants are bit-near-exact (CPU rel-err ~1e-7); this selector lets one
 # image build A/B the lowerings on hardware.  Values: "loop" (default, safe),
-# "matmul", "matmul_contig", "einsum", "bmm".
+# "matmul", "matmul_contig", "einsum", "bmm", and "nki".  The "nki" form emits
+# the contraction as a hand-written NKI TensorEngine matmul
+# (``nki_within_chunk_state_update``); unlike every XLA-lowered torch form (all
+# of which crash neuronx-cc with NCC_INLA001) it compiles, collapsing the
+# 64-step loop to one dense matmul per chunk while staying bit-near-exact.
 _DELTANET_STATE_UPDATE = os.environ.get("QWEN35_DELTANET_STATE_UPDATE", "loop")
 
 from neuronx_distributed.parallel_layers import parallel_state
@@ -267,6 +272,12 @@ def _within_chunk_state_update(
     ``chunk_size`` rank-1 updates per chunk (the single-chip prefill bottleneck).
     All variants are bit-near-exact.
     """
+    if _DELTANET_STATE_UPDATE == "nki" and _NKI_AVAILABLE:
+        # Hand-written NKI TensorEngine matmul: the only form of the contraction
+        # that compiles on neuronx-cc (all XLA-lowered torch forms hit
+        # NCC_INLA001).  Collapses the default 64-step rank-1 loop into one dense
+        # matmul per chunk, the principled single-chip (tp2) prefill win.
+        return nki_within_chunk_state_update(k_decay, v_new)
     if _DELTANET_STATE_UPDATE == "matmul":
         return k_decay.transpose(-1, -2) @ v_new
     if _DELTANET_STATE_UPDATE == "matmul_contig":
