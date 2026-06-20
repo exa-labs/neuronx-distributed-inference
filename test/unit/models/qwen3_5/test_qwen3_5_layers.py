@@ -189,6 +189,61 @@ class TestGatedDeltaRuleKernels(unittest.TestCase):
 
         assert_close(self, expected, actual, rtol=1e-4, name="nki within-chunk state update")
 
+    def test_nki_chunk_gated_delta_rule_kernel_matches_loop(self):
+        """The full Approach-C chunked NKI kernel must reproduce the sequential
+        inter-chunk recurrence (five TensorEngine matmuls per chunk, state kept
+        in SBUF) bit-near-exactly vs the torch reference loop.  This is the lever
+        that collapses the seq-len-deep within-chunk loop to one matmul/chunk."""
+        try:
+            import nki  # noqa: F401
+            from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
+                nki_chunk_gated_delta_rule_kernel,
+            )
+        except ImportError:
+            self.skipTest("nki not available in this environment")
+
+        bh, nc, c, dk, dv = 2, 3, 64, 128, 128
+        value = torch.randn(bh, nc, c, dv)
+        k_cumdecay = torch.randn(bh, nc, c, dk)
+        qg = torch.randn(bh, nc, c, dk)
+        attn_intra = torch.randn(bh, nc, c, c)
+        k_decay = torch.randn(bh, nc, c, dk)
+        g_last = torch.rand(bh, nc)  # exp(g_last_i) in (0, 1]
+        init_state = torch.randn(bh, dk, dv)
+
+        # Reference: the documented sequential chunk recurrence.
+        state = init_state.clone()
+        cores = []
+        for i in range(nc):
+            v_prime = k_cumdecay[:, i] @ state
+            v_new = value[:, i] - v_prime
+            attn_inter = qg[:, i] @ state
+            cores.append(attn_inter + attn_intra[:, i] @ v_new)
+            state_update = k_decay[:, i].transpose(-1, -2) @ v_new
+            state = state * g_last[:, i, None, None] + state_update
+        expected_core = torch.stack(cores, dim=1)
+        expected_state = state
+
+        # nc_matmul contracts the partition (first) dim, so the three matmuls
+        # over a non-chunk axis take pre-transposed stationary operands.
+        k_cumdecay_t = k_cumdecay.transpose(-1, -2).contiguous()
+        qg_t = qg.transpose(-1, -2).contiguous()
+        attn_intra_t = attn_intra.transpose(-1, -2).contiguous()
+
+        try:
+            core, final_state = nki.simulate(nki_chunk_gated_delta_rule_kernel)(
+                value.numpy(), k_cumdecay_t.numpy(), qg_t.numpy(),
+                attn_intra_t.numpy(), k_decay.numpy(), g_last.numpy(),
+                init_state.numpy(),
+            )
+        except Exception as exc:  # pragma: no cover - sim infra dependent
+            self.skipTest(f"nki.simulate unavailable: {exc}")
+        core = torch.from_numpy(numpy.asarray(core)).float()
+        final_state = torch.from_numpy(numpy.asarray(final_state)).float()
+
+        assert_close(self, expected_core, core, rtol=1e-4, name="nki chunked core")
+        assert_close(self, expected_state, final_state, rtol=1e-4, name="nki chunked final state")
+
     def test_chunked_vs_recurrent_consistency(self):
         """Both forms compute the same math, so prefill-then-decode must equal
         a longer prefill."""

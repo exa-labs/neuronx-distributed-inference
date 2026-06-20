@@ -196,3 +196,127 @@ def nki_within_chunk_state_update(k_decay_ref, v_new_ref):
         nisa.dma_copy(dst=out_ref[idx, :, :], src=su)
 
     return out_ref
+
+
+@nki.jit(mode="torchxla")
+def nki_chunk_gated_delta_rule_kernel(
+    value_ref,
+    k_cumdecay_t_ref,
+    qg_t_ref,
+    attn_intra_t_ref,
+    k_decay_ref,
+    g_last_ref,
+    state_ref,
+):
+    """Chunked gated delta rule: sequential inter-chunk recurrence on TensorEngine.
+
+    Runs the DeltaNet chunk recurrence as ``num_chunks`` sequential steps (vs the
+    HF reference's ``seq_len`` per-token steps) keeping the [Dk, Dv] recurrent
+    state resident in SBUF across the whole chunk loop.  Every state-dependent op
+    is a full TensorEngine matmul, so the ~64-step sequential within-chunk loop
+    (the only torch form neuronx-cc compiles, and the tp2 prefill bottleneck)
+    collapses to five ``nc_matmul`` per chunk.
+
+    The caller (``nki_chunk_gated_delta_rule`` in modeling) precomputes every
+    state-independent quantity in torch and pre-transposes the matmul stationary
+    operands so each contraction axis lands on the partition dim, as
+    ``nc_matmul(out[M, N], A[K, M], B[K, N]) = A^T @ B`` contracts over the
+    partition dim ``K``.
+
+    Per chunk ``i`` (state ``S`` ∈ R^{Dk×Dv}, C = chunk_size <= 128):
+      1. v_prime[C, Dv]    = k_cumdecay_i[C, Dk] @ S        (contract Dk)
+      2. v_new[C, Dv]      = value_i - v_prime
+      3. attn_inter[C, Dv] = (q_i * exp(g_i))[C, Dk] @ S    (contract Dk)
+      4. core_i[C, Dv]     = attn_inter + attn_intra_i[C, C] @ v_new (contract C)
+      5. state_update      = k_decay_i^T[Dk, C] @ v_new[C, Dv]       (contract C)
+      6. S                 = S * exp(g_last_i) + state_update
+
+    Args:
+        value_ref:        [BH, NC, C, Dv]  UT-transformed values (= attn @ v_beta)
+        k_cumdecay_t_ref: [BH, NC, Dk, C]  k_cumdecay transposed (stationary)
+        qg_t_ref:         [BH, NC, Dk, C]  (query * exp(g)) transposed (stationary)
+        attn_intra_t_ref: [BH, NC, C, C]   intra-chunk attn transposed (stationary)
+        k_decay_ref:      [BH, NC, C, Dk]  decayed keys (natural layout)
+        g_last_ref:       [BH, NC]         exp-arg of the last-token cumulative gate
+        state_ref:        [BH, Dk, Dv]     initial recurrent state (fp32)
+
+    Returns:
+        out_ref:         [BH, NC, C, Dv]  per-chunk core attention output (fp32)
+        final_state_ref: [BH, Dk, Dv]     final recurrent state (fp32)
+    """
+    bh = value_ref.shape[0]
+    nc = value_ref.shape[1]
+    c = value_ref.shape[2]
+    dv = value_ref.shape[3]
+    dk = k_decay_ref.shape[3]
+
+    out_ref = nl.ndarray((bh, nc, c, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+    final_state_ref = nl.ndarray((bh, dk, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    # Ones row for broadcasting the per-chunk scalar gate to [Dk, 1] via matmul.
+    ones_row = nl.ndarray((1, _D), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(ones_row, 1.0)
+
+    for idx in nl.affine_range(bh):
+        state = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=state, src=state_ref[idx, :, :])
+
+        for i in nl.sequential_range(nc):
+            # Load this chunk's precomputed tiles. Partition (first) dim of each
+            # tile is the contraction axis of the matmul it feeds.
+            kcd_t = nl.ndarray((dk, c), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=kcd_t, src=k_cumdecay_t_ref[idx, i, :, :])
+            qg_t = nl.ndarray((dk, c), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=qg_t, src=qg_t_ref[idx, i, :, :])
+            ait = nl.ndarray((c, c), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=ait, src=attn_intra_t_ref[idx, i, :, :])
+            kd = nl.ndarray((c, dk), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=kd, src=k_decay_ref[idx, i, :, :])
+            v = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=v, src=value_ref[idx, i, :, :])
+
+            # 1. v_prime[C, Dv] = k_cumdecay_i[C, Dk] @ S  (contract Dk = partition).
+            vp_psum = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(vp_psum, kcd_t, state)
+            vp = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(vp, vp_psum)
+
+            # 2. v_new = value_i - v_prime.
+            v_new = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(v_new, v, vp, op=nl.subtract)
+
+            # 3. attn_inter[C, Dv] = (q_i*exp(g_i))[C, Dk] @ S  (contract Dk).
+            ai_psum = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(ai_psum, qg_t, state)
+            ai = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(ai, ai_psum)
+
+            # 4. core_i = attn_inter + attn_intra_i @ v_new  (contract C = partition).
+            tmp_psum = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(tmp_psum, ait, v_new)
+            tmp = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(tmp, tmp_psum)
+            core = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(core, ai, tmp, op=nl.add)
+            nisa.dma_copy(dst=out_ref[idx, i, :, :], src=core)
+
+            # 5. state_update[Dk, Dv] = k_decay_i^T @ v_new  (contract C = partition).
+            su_psum = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(su_psum, kd, v_new)
+            su = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(su, su_psum)
+
+            # 6. S = S * exp(g_last_i) + state_update.
+            # Broadcast the per-chunk scalar gate to [Dk, 1]: ones[1,Dk]^T @ g[1,1].
+            g_last_t = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=g_last_t, src=g_last_ref[idx, i:i + 1])
+            g_bc_psum = nl.ndarray((_D, 1), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(g_bc_psum, ones_row, g_last_t)
+            g_bc = nl.ndarray((_D, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(g_bc, g_bc_psum)
+            nisa.tensor_scalar(state, state, nl.multiply, g_bc)
+            nisa.tensor_tensor(state, state, su, op=nl.add)
+
+        nisa.dma_copy(dst=final_state_ref[idx, :, :], src=state)
+
+    return out_ref, final_state_ref

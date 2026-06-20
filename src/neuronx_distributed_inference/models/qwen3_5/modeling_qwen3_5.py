@@ -44,6 +44,7 @@ from torch import nn
 # the recurrent XLA graph triggers PGTiling (NCC_IPCC901) at batch>=8.
 try:
     from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
+        nki_chunk_gated_delta_rule_kernel,
         nki_recurrent_gated_delta_rule,
         nki_within_chunk_state_update,
     )
@@ -276,8 +277,11 @@ def _within_chunk_state_update(
         # Hand-written NKI TensorEngine matmul: the only form of the contraction
         # that compiles on neuronx-cc (all XLA-lowered torch forms hit
         # NCC_INLA001).  Collapses the default 64-step rank-1 loop into one dense
-        # matmul per chunk, the principled single-chip (tp2) prefill win.
-        return nki_within_chunk_state_update(k_decay, v_new)
+        # matmul per chunk, the principled single-chip (tp2) prefill win.  Inputs
+        # are made contiguous so the NKI MLIR frontend can resolve their static
+        # shapes during in-model tracing (the per-chunk slices ``k_i``/``v_new``
+        # are non-contiguous views, which otherwise fail name resolution).
+        return nki_within_chunk_state_update(k_decay.contiguous(), v_new.contiguous())
     if _DELTANET_STATE_UPDATE == "matmul":
         return k_decay.transpose(-1, -2) @ v_new
     if _DELTANET_STATE_UPDATE == "matmul_contig":
@@ -424,6 +428,122 @@ def chunk_gated_delta_rule(
         batch_size, num_heads, k_head_dim, v_head_dim
     )
     return core_attn_out, last_recurrent_state
+
+
+def nki_chunk_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int = 64,
+    initial_state: Optional[torch.Tensor] = None,
+):
+    """Chunk-parallel gated delta rule with the inter-chunk recurrence in NKI.
+
+    Same interface and result as ``chunk_gated_delta_rule`` (bit-near-exact, CPU
+    rel-err ~2e-7), but the sequential chunk loop -- the prefill bottleneck on a
+    single chip (tp2) -- runs as a hand-written NKI kernel instead of XLA-traced
+    torch.  Torch precomputes every *state-independent* quantity (the UT
+    transform, ``decay_mask``, ``value = attn @ v_beta``, ``k_cumdecay``, the
+    intra-chunk attention ``attn_intra``, ``q*exp(g)``, ``k_decay``, the per-chunk
+    gate ``exp(g_last)``) exactly as the reference does; the NKI kernel then runs
+    the ~``num_chunks`` sequential steps, each five TensorEngine matmuls, keeping
+    the [Dk, Dv] state resident in SBUF.  This collapses the reference's only
+    neuronx-cc-compilable within-chunk form (the ``chunk_size``-step rank-1 loop,
+    whose sequential depth scales with seq-len) to one dense matmul per chunk.
+
+    The kernel contracts over the partition dim (``nc_matmul(out, A, B) =
+    A^T @ B``), so the stationary operands of the three matmuls that contract a
+    non-chunk axis (``k_cumdecay``, ``q*exp(g)``, ``attn_intra``) are
+    pre-transposed here in torch; ``k_decay`` and ``value`` already contract the
+    chunk axis and stay in natural layout.
+
+    Inputs: [B, S, H, D] shaped (query/key/value), [B, S, H] (g/beta); returns
+    (core_attn_out [B, S, H, Dv], final_state [B, H, Dk, Dv]).
+    """
+    initial_dtype = query.dtype
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+    ]
+
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    query = F.pad(query, (0, 0, 0, pad_size))
+    key = F.pad(key, (0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    g = F.pad(g, (0, pad_size))
+
+    total_sequence_length = query.shape[-2]
+    scale = 1 / (query.shape[-1] ** 0.5)
+    query = l2norm(query, dim=-1) * scale
+    key = l2norm(key, dim=-1)
+
+    bh = batch_size * num_heads
+    query, key, value = [
+        x.reshape(bh, -1, chunk_size, x.shape[-1]) for x in (query, key, value)
+    ]
+    g = g.reshape(bh, -1, chunk_size)
+    beta = beta.reshape(bh, -1, chunk_size)
+
+    g = g.cumsum(dim=-1)
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+
+    k_beta = key * beta.unsqueeze(-1)
+    v_beta = value * beta.unsqueeze(-1)
+
+    keep_strict_lower = torch.tril(
+        torch.ones(chunk_size, chunk_size, dtype=decay_mask.dtype, device=query.device),
+        diagonal=-1,
+    )
+    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask) * keep_strict_lower
+    for i in range(1, chunk_size):
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+
+    value = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+
+    keep_lower = torch.tril(
+        torch.ones(chunk_size, chunk_size, dtype=decay_mask.dtype, device=query.device),
+        diagonal=0,
+    )
+
+    # State-independent per-chunk quantities consumed by the NKI recurrence.
+    attn_intra = (query @ key.transpose(-1, -2) * decay_mask) * keep_lower
+    qg = query * g[..., None].exp()
+    g_last = g[:, :, -1].exp()
+    k_decay = key * (g[:, :, -1:] - g).exp()[..., None]
+
+    if initial_state is None:
+        init_state = torch.zeros(
+            bh, k_head_dim, v_head_dim, dtype=torch.float32, device=query.device
+        )
+    else:
+        init_state = initial_state.to(torch.float32).reshape(bh, k_head_dim, v_head_dim)
+
+    # Pre-transpose the stationary operands whose contraction axis is not the
+    # chunk dim so the NKI nc_matmul contracts over the partition (first) dim.
+    k_cumdecay_t = k_cumdecay.transpose(-1, -2).contiguous()
+    qg_t = qg.transpose(-1, -2).contiguous()
+    attn_intra_t = attn_intra.transpose(-1, -2).contiguous()
+    value = value.contiguous()
+    k_decay = k_decay.contiguous()
+    g_last = g_last.contiguous()
+
+    core_flat, final_state_flat = nki_chunk_gated_delta_rule_kernel(
+        value, k_cumdecay_t, qg_t, attn_intra_t, k_decay, g_last, init_state
+    )
+
+    core_attn_out = core_flat.reshape(batch_size, num_heads, total_sequence_length, v_head_dim)
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    final_state = final_state_flat.reshape(batch_size, num_heads, k_head_dim, v_head_dim)
+    return core_attn_out, final_state
 
 
 def recurrent_gated_delta_rule(
