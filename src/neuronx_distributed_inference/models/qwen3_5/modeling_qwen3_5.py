@@ -133,6 +133,17 @@ _DELTANET_SHARD_DECODE = os.environ.get("QWEN35_DELTANET_SHARD_DECODE") == "1"
 # 64-step loop to one dense matmul per chunk while staying bit-near-exact.
 _DELTANET_STATE_UPDATE = os.environ.get("QWEN35_DELTANET_STATE_UPDATE", "loop")
 
+# UT-transform algorithm for the chunk-parallel prefill path.  The UT
+# (unit-lower-triangular transform) computes ``value = (I - L)^{-1} @ v_beta``
+# and ``k_cumdecay = (I - L)^{-1} @ (k_beta * exp(g))``.  The default "loop"
+# builds the explicit inverse via a C-step sequential loop (lines of the form
+# ``attn[i,:i] += row @ sub``), which has O(C^3) work and O(C) graph depth.
+# The "solve_tri" mode uses ``torch.linalg.solve_triangular`` — one fused HLO
+# op that the compiler may handle natively.  The "fwd_sub" mode does direct
+# forward-substitution on the two RHS vectors (same depth but avoids the
+# expensive ``sub`` submatrix clones and the explicit [C,C] inverse).
+_DELTANET_UT_MODE = os.environ.get("QWEN35_DELTANET_UT_MODE", "loop")
+
 # Decode kernel selection.  "nki" (default) dispatches through the NKI recurrent
 # kernel (nki_recurrent_gated_delta_rule) which is always safe at any batch size
 # but carries per-invocation overhead (tensor reshapes + NKI trace).  "torch" uses
@@ -523,15 +534,37 @@ def nki_chunk_gated_delta_rule(
         torch.ones(chunk_size, chunk_size, dtype=decay_mask.dtype, device=query.device),
         diagonal=-1,
     )
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask) * keep_strict_lower
-    for i in range(1, chunk_size):
-        row = attn[..., i, :i].clone()
-        sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    # L is the strictly-lower-triangular intra-chunk coupling matrix.
+    L = -((k_beta @ key.transpose(-1, -2)) * decay_mask) * keep_strict_lower
+    rhs2 = k_beta * g.exp().unsqueeze(-1)
 
-    value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    if _DELTANET_UT_MODE == "solve_tri":
+        # (I - L) is unit lower-triangular.  Solve (I-L) @ X = RHS directly —
+        # a single TriangularSolve HLO op (no explicit inverse, O(1) depth).
+        A = torch.eye(chunk_size, dtype=L.dtype, device=L.device) - L
+        value = torch.linalg.solve_triangular(A, v_beta, upper=False, unitriangular=True)
+        k_cumdecay = torch.linalg.solve_triangular(A, rhs2, upper=False, unitriangular=True)
+    elif _DELTANET_UT_MODE == "fwd_sub":
+        # Direct forward substitution on the RHS vectors — same O(C) depth as
+        # "loop" but avoids forming the full [C,C] inverse and the expensive
+        # growing-submatrix clones.  Each step is one small mat-vec.
+        value = v_beta.clone()
+        k_cumdecay = rhs2.clone()
+        for i in range(1, chunk_size):
+            corr_v = L[..., i : i + 1, :i] @ value[..., :i, :]
+            value[..., i : i + 1, :] = value[..., i : i + 1, :] + corr_v
+            corr_k = L[..., i : i + 1, :i] @ k_cumdecay[..., :i, :]
+            k_cumdecay[..., i : i + 1, :] = k_cumdecay[..., i : i + 1, :] + corr_k
+    else:
+        # Default "loop": explicit inverse via sequential row updates (HF ref).
+        attn = L.clone()
+        for i in range(1, chunk_size):
+            row = attn[..., i, :i].clone()
+            sub = attn[..., :i, :i].clone()
+            attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+        attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+        value = attn @ v_beta
+        k_cumdecay = attn @ rhs2
 
     keep_lower = torch.tril(
         torch.ones(chunk_size, chunk_size, dtype=decay_mask.dtype, device=query.device),
