@@ -613,7 +613,7 @@ def nki_gated_delta_rule(
     beta: torch.Tensor,
     initial_state: torch.Tensor,
 ):
-    """NKI-accelerated gated delta rule for CTE (context encoding).
+    """NKI-accelerated gated delta rule (decode and CTE).
 
     Same interface as recurrent_gated_delta_rule but dispatches to the
     custom NKI kernel that bypasses XLA trace and PGTiling. Handles the
@@ -621,14 +621,61 @@ def nki_gated_delta_rule(
     by the NKI kernel.
 
     Inputs: [B, S, H, D] shaped (same as recurrent_gated_delta_rule).
+
+    For decode (S=1), uses a specialized layout path that avoids the
+    transpose+contiguous chain — the seq-dim-1 tensors reshape directly
+    to the NKI kernel layout without data copies.
     """
     initial_dtype = query.dtype
+    batch_size = query.shape[0]
+    sequence_length = query.shape[1]
+    num_heads = query.shape[2]
+    k_head_dim = query.shape[3]
+    v_head_dim = value.shape[3]
+    bh = batch_size * num_heads
+
+    if sequence_length == 1:
+        # ── Decode fast-path (seq_len=1) ──────────────────────────────────
+        # Skip transpose+contiguous: [B,1,H,D] → squeeze → [B,H,D] → reshape
+        # to [BH,D].  For S=1, the transpose [B,S,H,D]→[B,H,S,D] is a
+        # stride-only change and the subsequent reshape to [BH,1,D] / [BH,D,1]
+        # can be done without a copy.
+        q_f32 = query.squeeze(1).to(torch.float32).reshape(bh, k_head_dim)
+        k_f32 = key.squeeze(1).to(torch.float32).reshape(bh, k_head_dim)
+        v_f32 = value.squeeze(1).to(torch.float32).reshape(bh, v_head_dim)
+
+        scale = 1 / (k_head_dim ** 0.5)
+        q_f32 = l2norm(q_f32, dim=-1) * scale
+        k_f32 = l2norm(k_f32, dim=-1)
+
+        # exp(g): [B,1,H,1] → squeeze → [B,H] → reshape → [BH]
+        exp_g_flat = g.squeeze(1).squeeze(-1).to(torch.float32).exp().reshape(bh)
+        # beta: [B,1,H,1] → squeeze → [B,H] → reshape → [BH]
+        beta_flat = beta.squeeze(1).squeeze(-1).to(torch.float32).reshape(bh)
+
+        # NKI kernel expects: q[BH,Dk,1], k[BH,Dk,1], v[BH,1,Dv]
+        q_col = q_f32.unsqueeze(-1).contiguous()  # [BH, Dk, 1]
+        k_col = k_f32.unsqueeze(-1).contiguous()  # [BH, Dk, 1]
+        v_row = v_f32.unsqueeze(1).contiguous()   # [BH, 1, Dv]
+        exp_g_2d = exp_g_flat.unsqueeze(-1).contiguous()  # [BH, 1]
+        beta_2d = beta_flat.unsqueeze(-1).contiguous()    # [BH, 1]
+        state_flat = initial_state.reshape(bh, k_head_dim, v_head_dim).contiguous()
+
+        out_flat, final_state_flat = nki_recurrent_gated_delta_rule(
+            q_col, k_col, v_row, exp_g_2d, beta_2d, state_flat
+        )
+
+        # Output: [BH, 1, Dv] → [B, 1, H, Dv]
+        core_attn_out = out_flat.reshape(
+            batch_size, num_heads, 1, v_head_dim
+        ).transpose(1, 2).contiguous().to(initial_dtype)
+        final_state = final_state_flat.reshape(batch_size, num_heads, k_head_dim, v_head_dim)
+        return core_attn_out, final_state
+
+    # ── General path (seq_len > 1, used for CTE) ─────────────────────────
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
     ]
-
-    batch_size, num_heads, sequence_length, k_head_dim = key.shape
-    v_head_dim = value.shape[-1]
 
     scale = 1 / (query.shape[-1] ** 0.5)
     query = l2norm(query, dim=-1) * scale
@@ -638,7 +685,6 @@ def nki_gated_delta_rule(
     exp_g = g.exp().squeeze(-1)  # [B, H, T]
 
     # Reshape for NKI: merge batch and heads → BH
-    bh = batch_size * num_heads
     # q, k: [B, H, T, D] → [BH, D, T] (column-major for [128,1] loads)
     q_col = query.reshape(bh, sequence_length, k_head_dim).transpose(1, 2).contiguous()
     k_col = key.reshape(bh, sequence_length, k_head_dim).transpose(1, 2).contiguous()
