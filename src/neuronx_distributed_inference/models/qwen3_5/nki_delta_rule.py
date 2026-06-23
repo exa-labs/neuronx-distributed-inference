@@ -38,7 +38,7 @@ _D = 128  # fits exactly in one NeuronCore-v2 partition (128)
 def nki_recurrent_gated_delta_rule(
     q_ref, k_ref, v_ref, exp_g_ref, beta_ref, state_ref
 ):
-    """NKI recurrent gated delta rule kernel.
+    """NKI recurrent gated delta rule kernel (general, any T).
 
     Args:
         q_ref:     [BH, Dk, T]  queries (column-major, l2-normed+scaled)
@@ -141,6 +141,114 @@ def nki_recurrent_gated_delta_rule(
             out_cast = nl.ndarray((1, dv), dtype=q_ref.dtype, buffer=nl.sbuf)
             nisa.tensor_scalar(out_cast, out_sbuf, nl.multiply, 1.0)
             nisa.dma_copy(dst=out_ref[idx, t:t+1, :], src=out_cast)
+
+        # Store final state
+        nisa.dma_copy(dst=final_state_ref[idx, :, :], src=state)
+
+    return out_ref, final_state_ref
+
+
+@nki.jit(mode="torchxla")
+def nki_recurrent_gated_delta_rule_decode(
+    q_ref, k_ref, k_row_ref, v_ref, exp_g_ref, beta_ref, state_ref
+):
+    """Decode-optimized NKI kernel for T=1 (single token per step).
+
+    Eliminates the per-head nc_transpose by accepting k in row-major layout
+    directly.  For T=1 the wrapper provides k as both [BH, Dk, 1] (column,
+    for the k^T @ state mat-vec) and [BH, 1, Dk] (row, for the outer product
+    k ⊗ delta).  The row format is a zero-cost view in torch for T=1.
+
+    Saves 2 TensorEngine instructions per head (nc_transpose + tensor_copy)
+    relative to the general kernel — with 128 BH per core per layer × 24
+    DeltaNet layers, this is ~6144 fewer instructions per decode step.
+
+    Args:
+        q_ref:     [BH, Dk, 1]  queries (column-major, l2-normed+scaled)
+        k_ref:     [BH, Dk, 1]  keys (column-major, for k^T @ state)
+        k_row_ref: [BH, 1, Dk]  keys (row-major, for outer product)
+        v_ref:     [BH, 1, Dv]  values (row-major)
+        exp_g_ref: [BH, 1]      pre-computed exp(g)
+        beta_ref:  [BH, 1]      beta scalars
+        state_ref: [BH, Dk, Dv] initial state (fp32)
+
+    Returns:
+        out_ref:         [BH, 1, Dv]  output (row-major, input dtype)
+        final_state_ref: [BH, Dk, Dv] final state (fp32)
+    """
+    bh = q_ref.shape[0]
+    dk = q_ref.shape[1]   # Dk = 128
+    dv = v_ref.shape[2]   # Dv = 128
+
+    out_ref = nl.ndarray((bh, 1, dv), dtype=q_ref.dtype, buffer=nl.shared_hbm)
+    final_state_ref = nl.ndarray((bh, dk, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    # Ones vector for scalar broadcast: ones[1,128]^T @ s[1,1] → [128,1]
+    ones_row = nl.ndarray((1, _D), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(ones_row, 1.0)
+
+    for idx in nl.affine_range(bh):
+        # ── Load all inputs for this head ──────────────────────────────────
+        state = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=state, src=state_ref[idx, :, :])
+
+        q_t = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=q_t, src=q_ref[idx, :, :])
+
+        k_t = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=k_t, src=k_ref[idx, :, :])
+
+        # Row-major key for outer product (eliminates nc_transpose)
+        k_row = nl.ndarray((1, dk), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=k_row, src=k_row_ref[idx, :, :])
+
+        v_t = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=v_t, src=v_ref[idx, :, :])
+
+        exp_g_t = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=exp_g_t, src=exp_g_ref[idx, :])
+
+        beta_t = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=beta_t, src=beta_ref[idx, :])
+
+        # ── Step 1: state *= exp(g) ───────────────────────────────────────
+        exp_g_bc_psum = nl.ndarray((_D, 1), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(exp_g_bc_psum, ones_row, exp_g_t)
+        exp_g_bc = nl.ndarray((_D, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(exp_g_bc, exp_g_bc_psum)
+        nisa.tensor_scalar(state, state, nl.multiply, exp_g_bc)
+
+        # ── Step 2: kv_mem = k^T @ state → [1, Dv] ───────────────────────
+        kv_psum = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(kv_psum, k_t, state)
+        kv_mem = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(kv_mem, kv_psum)
+
+        # ── Step 3: delta = (v - kv_mem) * beta → [1, Dv] ────────────────
+        delta = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(delta, v_t, kv_mem, op=nl.subtract)
+        nisa.tensor_scalar(delta, delta, nl.multiply, beta_t)
+
+        # ── Step 4: state += outer(k, delta) → [Dk, Dv] ──────────────────
+        # nc_matmul(out[M,N], A[K,M], B[K,N]): K=1, M=Dk=128, N=Dv=128
+        # A = k_row[1, 128], B = delta[1, 128]
+        # out[128,128] = k_row^T[128,1] @ delta[1,128] = outer product
+        outer_psum = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(outer_psum, k_row, delta)
+        outer = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(outer, outer_psum)
+        nisa.tensor_tensor(state, state, outer, op=nl.add)
+
+        # ── Step 5: out = q^T @ state → [1, Dv] ──────────────────────────
+        out_psum = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(out_psum, q_t, state)
+        out_sbuf = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(out_sbuf, out_psum)
+
+        # Cast back to input dtype and store
+        out_cast = nl.ndarray((1, dv), dtype=q_ref.dtype, buffer=nl.sbuf)
+        nisa.tensor_scalar(out_cast, out_sbuf, nl.multiply, 1.0)
+        nisa.dma_copy(dst=out_ref[idx, :, :], src=out_cast)
 
         # Store final state
         nisa.dma_copy(dst=final_state_ref[idx, :, :], src=state)

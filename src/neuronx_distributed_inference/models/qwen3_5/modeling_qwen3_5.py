@@ -46,6 +46,7 @@ try:
     from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
         nki_chunk_gated_delta_rule_kernel,
         nki_recurrent_gated_delta_rule,
+        nki_recurrent_gated_delta_rule_decode,
         nki_within_chunk_state_update,
     )
     _NKI_AVAILABLE = True
@@ -653,16 +654,18 @@ def nki_gated_delta_rule(
         # beta: [B,1,H,1] → squeeze → [B,H] → reshape → [BH]
         beta_flat = beta.squeeze(1).squeeze(-1).to(torch.float32).reshape(bh)
 
-        # NKI kernel expects: q[BH,Dk,1], k[BH,Dk,1], v[BH,1,Dv]
+        # Decode kernel expects: q[BH,Dk,1], k[BH,Dk,1], k_row[BH,1,Dk],
+        # v[BH,1,Dv], exp_g[BH,1], beta[BH,1]
         q_col = q_f32.unsqueeze(-1).contiguous()  # [BH, Dk, 1]
         k_col = k_f32.unsqueeze(-1).contiguous()  # [BH, Dk, 1]
+        k_row = k_f32.unsqueeze(1).contiguous()   # [BH, 1, Dk]
         v_row = v_f32.unsqueeze(1).contiguous()   # [BH, 1, Dv]
         exp_g_2d = exp_g_flat.unsqueeze(-1).contiguous()  # [BH, 1]
         beta_2d = beta_flat.unsqueeze(-1).contiguous()    # [BH, 1]
         state_flat = initial_state.reshape(bh, k_head_dim, v_head_dim).contiguous()
 
-        out_flat, final_state_flat = nki_recurrent_gated_delta_rule(
-            q_col, k_col, v_row, exp_g_2d, beta_2d, state_flat
+        out_flat, final_state_flat = nki_recurrent_gated_delta_rule_decode(
+            q_col, k_col, k_row, v_row, exp_g_2d, beta_2d, state_flat
         )
 
         # Output: [BH, 1, Dv] → [B, 1, H, Dv]
