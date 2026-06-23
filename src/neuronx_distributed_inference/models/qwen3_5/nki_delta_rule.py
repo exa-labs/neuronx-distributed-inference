@@ -350,6 +350,123 @@ def nki_recurrent_gated_delta_rule_decode_v2(
 
 
 @nki.jit(mode="torchxla")
+def nki_recurrent_gated_delta_rule_decode_v3(
+    q_ref, k_ref, k_beta_col_ref, k_beta_row_ref, v_ref, exp_g_bc_ref, state_ref
+):
+    """Decode kernel v3: fused q/k matmul + algebraic output (rank-1 decomposition).
+
+    Key algebraic insight: the state update ``outer(k*beta, delta)`` is rank-1, so
+    ``q^T @ state_new = q^T @ state_scaled + dot(q, k*beta) * delta``.
+    This eliminates the critical-path dependency of the output computation on the
+    full state update, enabling the compiler to pipeline state-write and output-write
+    independently. Also fuses the k^T@state and q^T@state matmuls into a single
+    [K=Dk, M=2]^T @ [K=Dk, N=Dv] operation, saving one nc_matmul dispatch.
+
+    Net savings vs v2: −1 nc_matmul (output), −1 tensor_copy, shorter critical path.
+    Adds 1 nc_matmul([1,1] dot product) + 1 tensor_scalar + 1 tensor_tensor, but
+    these are tiny ops (scalar/vector) vs the eliminated [128,128] mat-vec.
+
+    Args:
+        q_ref:          [BH, Dk, 1]  queries (column-major, l2-normed+scaled)
+        k_ref:          [BH, Dk, 1]  keys (column-major, for fused kq matmul)
+        k_beta_col_ref: [BH, Dk, 1]  keys * beta (column-major, for dot product)
+        k_beta_row_ref: [BH, 1, Dk]  keys * beta (row-major, for outer product)
+        v_ref:          [BH, 1, Dv]  values (row-major)
+        exp_g_bc_ref:   [BH, Dk]     exp(g) broadcast to Dk
+        state_ref:      [BH, Dk, Dv] initial state (fp32)
+
+    Returns:
+        out_ref:         [BH, 1, Dv]  output (row-major, fp32)
+        final_state_ref: [BH, Dk, Dv] final state (fp32)
+    """
+    bh = q_ref.shape[0]
+    dk = q_ref.shape[1]   # Dk = 128
+    dv = v_ref.shape[2]   # Dv = 128
+
+    out_ref = nl.ndarray((bh, 1, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+    final_state_ref = nl.ndarray((bh, dk, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    for idx in nl.affine_range(bh):
+        # ── Load inputs for this head ─────────────────────────────────────
+        state = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=state, src=state_ref[idx, :, :])
+
+        q_t = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=q_t, src=q_ref[idx, :, :])
+
+        k_t = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=k_t, src=k_ref[idx, :, :])
+
+        k_beta_col = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=k_beta_col, src=k_beta_col_ref[idx, :, :])
+
+        k_beta_row = nl.ndarray((1, dk), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=k_beta_row, src=k_beta_row_ref[idx, :, :])
+
+        v_t = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=v_t, src=v_ref[idx, :, :])
+
+        exp_g_bc = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=exp_g_bc, src=exp_g_bc_ref[idx, :])
+
+        # ── Step 1: state *= exp(g) ──────────────────────────────────────
+        nisa.tensor_scalar(state, state, nl.multiply, exp_g_bc)
+
+        # ── Step 2: fused kv_mem + q_state = [k; q]^T @ state ───────────
+        # Stack k and q into [Dk, 2] then matmul against state [Dk, Dv]
+        # nc_matmul: out[M, N] = A[K, M]^T @ B[K, N]
+        # A = kq_stacked[128, 2], B = state[128, 128] → out[2, 128]
+        kq_stacked = nl.ndarray((dk, 2), dtype=nl.float32, buffer=nl.sbuf)
+        kq_stacked[:, 0] = nl.copy(k_t[:, 0], dtype=nl.float32)
+        kq_stacked[:, 1] = nl.copy(q_t[:, 0], dtype=nl.float32)
+
+        kq_psum = nl.ndarray((2, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(kq_psum, kq_stacked, state)
+        kq_result = nl.ndarray((2, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(kq_result, kq_psum)
+
+        # Extract kv_mem[1, Dv] and q_state[1, Dv]
+        kv_mem = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        kv_mem[0, :] = nl.copy(kq_result[0, :], dtype=nl.float32)
+        q_state = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        q_state[0, :] = nl.copy(kq_result[1, :], dtype=nl.float32)
+
+        # ── Step 3: delta = v - kv_mem → [1, Dv] ────────────────────────
+        delta = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(delta, v_t, kv_mem, op=nl.subtract)
+
+        # ── Step 4: state += outer(k*beta, delta) → [Dk, Dv] ────────────
+        # (state update path — independent of output computation)
+        outer_psum = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(outer_psum, k_beta_row, delta)
+        outer = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(outer, outer_psum)
+        nisa.tensor_tensor(state, state, outer, op=nl.add)
+
+        # ── Step 5: output = q_state + dot(q, k*beta) * delta ────────────
+        # dot(q, k*beta) as a [1,1] matmul: q_t[Dk,1]^T @ k_beta_col[Dk,1]
+        # nc_matmul: out[1,1] = q_t[128,1]^T @ k_beta_col[128,1]
+        dot_psum = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(dot_psum, q_t, k_beta_col)
+        dot_val = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dot_val, dot_psum)
+
+        # correction = dot_val * delta → [1, Dv] (scalar broadcast)
+        correction = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(correction, delta, nl.multiply, dot_val)
+
+        # output = q_state + correction
+        out_sbuf = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(out_sbuf, q_state, correction, op=nl.add)
+
+        # Store output and final state
+        nisa.dma_copy(dst=out_ref[idx, :, :], src=out_sbuf)
+        nisa.dma_copy(dst=final_state_ref[idx, :, :], src=state)
+
+    return out_ref, final_state_ref
+
+
+@nki.jit(mode="torchxla")
 def nki_within_chunk_state_update(k_decay_ref, v_new_ref):
     """Within-chunk DeltaNet state increment as one TensorEngine matmul per head.
 

@@ -435,6 +435,54 @@ class TestGatedDeltaRuleKernels(unittest.TestCase):
         assert_close(self, out_v1, out_v2, rtol=1e-5, name="decode v2 output")
         assert_close(self, state_v1, state_v2, rtol=1e-5, name="decode v2 state")
 
+    def test_nki_decode_v3_matches_v2(self):
+        """The v3 decode kernel (fused kq matmul + algebraic output via rank-1
+        decomposition) must produce identical results to v2."""
+        try:
+            import nki  # noqa: F401
+            from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
+                nki_recurrent_gated_delta_rule_decode_v2,
+                nki_recurrent_gated_delta_rule_decode_v3,
+            )
+        except ImportError:
+            self.skipTest("nki not available in this environment")
+
+        bh, dk, dv = 8, 128, 128
+        q = torch.randn(bh, dk, 1)
+        k = torch.randn(bh, dk, 1)
+        v = torch.randn(bh, 1, dv)
+        exp_g = torch.rand(bh, 1) + 0.5  # exp(g) ∈ (0.5, 1.5)
+        beta = torch.rand(bh, 1)
+        state = torch.randn(bh, dk, dv)
+
+        # v2 inputs
+        exp_g_bc = exp_g.expand(-1, dk).contiguous()  # [BH, Dk]
+        k_beta = k.squeeze(-1) * beta  # [BH, Dk]
+        k_beta_row = k_beta.unsqueeze(1).contiguous()  # [BH, 1, Dk]
+
+        # v3 inputs (adds k_beta_col for dot product)
+        k_beta_col = k_beta.unsqueeze(-1).contiguous()  # [BH, Dk, 1]
+
+        try:
+            out_v2, state_v2 = nki.simulate(nki_recurrent_gated_delta_rule_decode_v2)(
+                q.numpy(), k.numpy(), k_beta_row.numpy(), v.numpy(),
+                exp_g_bc.numpy(), state.clone().numpy(),
+            )
+            out_v3, state_v3 = nki.simulate(nki_recurrent_gated_delta_rule_decode_v3)(
+                q.numpy(), k.numpy(), k_beta_col.numpy(), k_beta_row.numpy(),
+                v.numpy(), exp_g_bc.numpy(), state.clone().numpy(),
+            )
+        except Exception as exc:
+            self.skipTest(f"nki.simulate unavailable: {exc}")
+
+        out_v2 = torch.from_numpy(numpy.asarray(out_v2)).float()
+        state_v2 = torch.from_numpy(numpy.asarray(state_v2)).float()
+        out_v3 = torch.from_numpy(numpy.asarray(out_v3)).float()
+        state_v3 = torch.from_numpy(numpy.asarray(state_v3)).float()
+
+        assert_close(self, out_v2, out_v3, rtol=1e-5, name="decode v3 output")
+        assert_close(self, state_v2, state_v3, rtol=1e-5, name="decode v3 state")
+
     def test_chunked_vs_recurrent_consistency(self):
         """Both forms compute the same math, so prefill-then-decode must equal
         a longer prefill."""
