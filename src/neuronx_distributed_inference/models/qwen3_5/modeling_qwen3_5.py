@@ -47,6 +47,7 @@ try:
         nki_chunk_gated_delta_rule_kernel,
         nki_recurrent_gated_delta_rule,
         nki_recurrent_gated_delta_rule_decode,
+        nki_recurrent_gated_delta_rule_decode_v2,
         nki_within_chunk_state_update,
     )
     _NKI_AVAILABLE = True
@@ -130,7 +131,10 @@ _DELTANET_STATE_UPDATE = os.environ.get("QWEN35_DELTANET_STATE_UPDATE", "loop")
 # overhead.  The torch path originally tripped PGTiling at batch>=8 because of the
 # RowParallel out_proj all-reduce; with shard_decode (all-gather + replicated
 # out_proj) or replicated DeltaNet, the DAG is collective-free and may tile.
-_DELTANET_DECODE_KERNEL = os.environ.get("QWEN35_DELTANET_DECODE_KERNEL", "nki")
+# "nki" (default) = v1 kernel; "nki_v2" = optimized v2 (host-precomputed
+# exp_g broadcast + k*beta fusion — fewer DMA + instructions per head);
+# "torch" = pure-torch single-step (may crash neuronx-cc on big graphs).
+_DELTANET_DECODE_KERNEL = os.environ.get("QWEN35_DELTANET_DECODE_KERNEL", "nki_v2")
 
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
@@ -654,19 +658,31 @@ def nki_gated_delta_rule(
         # beta: [B,1,H,1] → squeeze → [B,H] → reshape → [BH]
         beta_flat = beta.squeeze(1).squeeze(-1).to(torch.float32).reshape(bh)
 
-        # Decode kernel expects: q[BH,Dk,1], k[BH,Dk,1], k_row[BH,1,Dk],
-        # v[BH,1,Dv], exp_g[BH,1], beta[BH,1]
         q_col = q_f32.unsqueeze(-1).contiguous()  # [BH, Dk, 1]
         k_col = k_f32.unsqueeze(-1).contiguous()  # [BH, Dk, 1]
-        k_row = k_f32.unsqueeze(1).contiguous()   # [BH, 1, Dk]
-        v_row = v_f32.unsqueeze(1).contiguous()   # [BH, 1, Dv]
-        exp_g_2d = exp_g_flat.unsqueeze(-1).contiguous()  # [BH, 1]
-        beta_2d = beta_flat.unsqueeze(-1).contiguous()    # [BH, 1]
         state_flat = initial_state.reshape(bh, k_head_dim, v_head_dim).contiguous()
 
-        out_flat, final_state_flat = nki_recurrent_gated_delta_rule_decode(
-            q_col, k_col, k_row, v_row, exp_g_2d, beta_2d, state_flat
-        )
+        if _DELTANET_DECODE_KERNEL == "nki_v2":
+            # v2: host-precomputed exp_g broadcast + k*beta fusion
+            # exp_g_bc: [BH, Dk] — same scalar repeated Dk times per head
+            exp_g_bc = exp_g_flat.unsqueeze(-1).expand(-1, k_head_dim).contiguous()
+            # k_beta_row: [BH, 1, Dk] — k * beta for outer product
+            k_beta_row = (k_f32 * beta_flat.unsqueeze(-1)).unsqueeze(1).contiguous()
+            v_row = v_f32.unsqueeze(1).contiguous()  # [BH, 1, Dv]
+
+            out_flat, final_state_flat = nki_recurrent_gated_delta_rule_decode_v2(
+                q_col, k_col, k_beta_row, v_row, exp_g_bc, state_flat
+            )
+        else:
+            # v1: original kernel with in-kernel exp_g broadcast
+            k_row = k_f32.unsqueeze(1).contiguous()   # [BH, 1, Dk]
+            v_row = v_f32.unsqueeze(1).contiguous()   # [BH, 1, Dv]
+            exp_g_2d = exp_g_flat.unsqueeze(-1).contiguous()  # [BH, 1]
+            beta_2d = beta_flat.unsqueeze(-1).contiguous()    # [BH, 1]
+
+            out_flat, final_state_flat = nki_recurrent_gated_delta_rule_decode(
+                q_col, k_col, k_row, v_row, exp_g_2d, beta_2d, state_flat
+            )
 
         # Output: [BH, 1, Dv] → [B, 1, H, Dv]
         core_attn_out = out_flat.reshape(
