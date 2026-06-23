@@ -538,7 +538,29 @@ def nki_chunk_gated_delta_rule(
     L = -((k_beta @ key.transpose(-1, -2)) * decay_mask) * keep_strict_lower
     rhs2 = k_beta * g.exp().unsqueeze(-1)
 
-    if _DELTANET_UT_MODE == "solve_tri":
+    if _DELTANET_UT_MODE == "neumann":
+        # Repeated squaring: (I-L)^{-1} = (I+L)(I+L^2)(I+L^4)...(I+L^{2^k})
+        # For C=64: k=5 (since L^64=0 for strictly-lower-triangular L).
+        # 5 squarings + 5 products + 2 applications = 12 batched matmuls total,
+        # replacing 63 sequential XLA-traced loop steps.
+        eye = torch.eye(chunk_size, dtype=L.dtype, device=L.device)
+        # Compute powers of L via repeated squaring
+        L2 = L @ L
+        L4 = L2 @ L2
+        L8 = L4 @ L4
+        L16 = L8 @ L8
+        L32 = L16 @ L16
+        # Accumulate the Neumann series as a product of factors
+        inv = eye + L
+        inv = inv @ (eye + L2)
+        inv = inv @ (eye + L4)
+        inv = inv @ (eye + L8)
+        inv = inv @ (eye + L16)
+        inv = inv @ (eye + L32)
+        # Apply the inverse to both RHS vectors
+        value = inv @ v_beta
+        k_cumdecay = inv @ rhs2
+    elif _DELTANET_UT_MODE == "solve_tri":
         # (I - L) is unit lower-triangular.  Solve (I-L) @ X = RHS directly —
         # a single TriangularSolve HLO op (no explicit inverse, O(1) depth).
         A = torch.eye(chunk_size, dtype=L.dtype, device=L.device) - L
