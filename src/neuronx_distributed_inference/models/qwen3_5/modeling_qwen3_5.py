@@ -121,6 +121,16 @@ _DELTANET_SHARD_DECODE = os.environ.get("QWEN35_DELTANET_SHARD_DECODE") == "1"
 # 64-step loop to one dense matmul per chunk while staying bit-near-exact.
 _DELTANET_STATE_UPDATE = os.environ.get("QWEN35_DELTANET_STATE_UPDATE", "loop")
 
+# Decode kernel selection.  "nki" (default) dispatches through the NKI recurrent
+# kernel (nki_recurrent_gated_delta_rule) which is always safe at any batch size
+# but carries per-invocation overhead (tensor reshapes + NKI trace).  "torch" uses
+# the pure-torch single-step form (no explicit loop at seq_len=1) — this produces
+# a simpler XLA graph with fused elementwise ops and eliminates the NKI wrapper
+# overhead.  The torch path originally tripped PGTiling at batch>=8 because of the
+# RowParallel out_proj all-reduce; with shard_decode (all-gather + replicated
+# out_proj) or replicated DeltaNet, the DAG is collective-free and may tile.
+_DELTANET_DECODE_KERNEL = os.environ.get("QWEN35_DELTANET_DECODE_KERNEL", "nki")
+
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
@@ -990,7 +1000,11 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
             initial_state = self.recurrent_state[seq_ids].reshape(
                 batch_size, -1, self.head_k_dim, self.head_v_dim
             )
-            if _USE_NKI_DELTA_RULE and _NKI_AVAILABLE:
+            if _DELTANET_DECODE_KERNEL == "torch":
+                core_attn_out, new_recurrent_state = recurrent_gated_delta_rule(
+                    query, key, value, g=g, beta=beta, initial_state=initial_state
+                )
+            elif _USE_NKI_DELTA_RULE and _NKI_AVAILABLE:
                 core_attn_out, new_recurrent_state = nki_gated_delta_rule(
                     query, key, value, g=g, beta=beta, initial_state=initial_state
                 )
