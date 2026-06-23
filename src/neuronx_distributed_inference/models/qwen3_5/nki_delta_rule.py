@@ -521,3 +521,103 @@ def nki_chunk_gated_delta_rule_kernel(
         nisa.dma_copy(dst=final_state_ref[idx, :, :], src=state)
 
     return out_ref, final_state_ref
+
+
+@nki.jit(mode="torchxla")
+def nki_chunk_gated_delta_rule_kernel_v2(
+    value_ref,
+    k_cumdecay_t_ref,
+    qg_t_ref,
+    attn_intra_t_ref,
+    k_decay_ref,
+    g_last_bc_ref,
+    state_ref,
+):
+    """Optimized chunked gated delta rule v2: pre-broadcast gate, no ones_row.
+
+    Same math as v1 but the per-chunk gate ``exp(g_last)`` is pre-broadcast on the
+    host to ``[BH, NC, Dk]`` (128 identical values per chunk), eliminating 3
+    instructions per chunk (scalar DMA + nc_matmul broadcast + tensor_copy).  This
+    drops the ``ones_row`` allocation and the per-chunk matmul from the critical
+    sequential path.
+
+    Args:
+        value_ref:        [BH, NC, C, Dv]  UT-transformed values
+        k_cumdecay_t_ref: [BH, NC, Dk, C]  k_cumdecay transposed (stationary)
+        qg_t_ref:         [BH, NC, Dk, C]  (query * exp(g)) transposed (stationary)
+        attn_intra_t_ref: [BH, NC, C, C]   intra-chunk attn transposed (stationary)
+        k_decay_ref:      [BH, NC, C, Dk]  decayed keys (natural layout)
+        g_last_bc_ref:    [BH, NC, Dk]     exp(g_last) pre-broadcast to Dk
+        state_ref:        [BH, Dk, Dv]     initial recurrent state (fp32)
+
+    Returns:
+        out_ref:         [BH, NC, C, Dv]  per-chunk core attention output (fp32)
+        final_state_ref: [BH, Dk, Dv]     final recurrent state (fp32)
+    """
+    bh = value_ref.shape[0]
+    nc = value_ref.shape[1]
+    c = value_ref.shape[2]
+    dv = value_ref.shape[3]
+    dk = k_decay_ref.shape[3]
+
+    out_ref = nl.ndarray((bh, nc, c, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+    final_state_ref = nl.ndarray((bh, dk, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    for idx in nl.affine_range(bh):
+        state = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=state, src=state_ref[idx, :, :])
+
+        for i in nl.sequential_range(nc):
+            # Load this chunk's precomputed tiles.
+            kcd_t = nl.ndarray((dk, c), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=kcd_t, src=k_cumdecay_t_ref[idx, i, :, :])
+            qg_t = nl.ndarray((dk, c), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=qg_t, src=qg_t_ref[idx, i, :, :])
+            ait = nl.ndarray((c, c), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=ait, src=attn_intra_t_ref[idx, i, :, :])
+            kd = nl.ndarray((c, dk), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=kd, src=k_decay_ref[idx, i, :, :])
+            v = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=v, src=value_ref[idx, i, :, :])
+
+            # 1. v_prime[C, Dv] = k_cumdecay_i[C, Dk] @ S  (contract Dk = partition).
+            vp_psum = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(vp_psum, kcd_t, state)
+            vp = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(vp, vp_psum)
+
+            # 2. v_new = value_i - v_prime.
+            v_new = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(v_new, v, vp, op=nl.subtract)
+
+            # 3. attn_inter[C, Dv] = (q_i*exp(g_i))[C, Dk] @ S  (contract Dk).
+            ai_psum = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(ai_psum, qg_t, state)
+            ai = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(ai, ai_psum)
+
+            # 4. core_i = attn_inter + attn_intra_i @ v_new  (contract C = partition).
+            tmp_psum = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(tmp_psum, ait, v_new)
+            tmp = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(tmp, tmp_psum)
+            core = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(core, ai, tmp, op=nl.add)
+            nisa.dma_copy(dst=out_ref[idx, i, :, :], src=core)
+
+            # 5. state_update[Dk, Dv] = k_decay_i^T @ v_new  (contract C = partition).
+            su_psum = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(su_psum, kd, v_new)
+            su = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(su, su_psum)
+
+            # 6. S = S * exp(g_last_i) + state_update.
+            # Gate is pre-broadcast on host: [Dk] loads as [Dk, 1] partition tile.
+            g_bc = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=g_bc, src=g_last_bc_ref[idx, i, :])
+            nisa.tensor_scalar(state, state, nl.multiply, g_bc)
+            nisa.tensor_tensor(state, state, su, op=nl.add)
+
+        nisa.dma_copy(dst=final_state_ref[idx, :, :], src=state)
+
+    return out_ref, final_state_ref

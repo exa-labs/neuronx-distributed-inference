@@ -45,6 +45,7 @@ from torch import nn
 try:
     from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
         nki_chunk_gated_delta_rule_kernel,
+        nki_chunk_gated_delta_rule_kernel_v2,
         nki_recurrent_gated_delta_rule,
         nki_recurrent_gated_delta_rule_decode,
         nki_recurrent_gated_delta_rule_decode_v2,
@@ -91,6 +92,14 @@ _DELTANET_SHARD_PREFILL = os.environ.get("QWEN35_DELTANET_SHARD_PREFILL") == "1"
 # compile it); "nki" runs the hand-written chunked NKI kernel that bypasses the
 # XLA trace entirely.
 _DELTANET_CHUNK_PREFILL = os.environ.get("QWEN35_DELTANET_CHUNK_PREFILL", "")
+
+# Chunk size for the chunked delta rule (both torch and NKI paths).  The NKI
+# kernel's nc_matmul operates on partition_dim × free_dim tiles up to [128, 128].
+# At chunk_size=64 (HF default), the matmuls that contract the chunk dim use
+# partition=64 — half the tensor engine's width.  At chunk_size=128 every matmul
+# hits full [128, 128] tile utilization AND the sequential depth halves (half as
+# many chunks per CTE pass).  Values: 64 (safe/default), 128 (optimal for NKI).
+_DELTANET_CHUNK_SIZE = int(os.environ.get("QWEN35_DELTANET_CHUNK_SIZE", "64"))
 
 # Fully shard the DeltaNet projections across ranks (in_proj ColumnParallel) in
 # BOTH prefill and decode, but drive the output through an all-gather of the
@@ -349,7 +358,7 @@ def chunk_gated_delta_rule(
     value: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    chunk_size: int = 64,
+    chunk_size: int = _DELTANET_CHUNK_SIZE,
     initial_state: Optional[torch.Tensor] = None,
 ):
     """Chunked parallel form of the gated delta rule (prefill path).
@@ -451,7 +460,7 @@ def nki_chunk_gated_delta_rule(
     value: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    chunk_size: int = 64,
+    chunk_size: int = _DELTANET_CHUNK_SIZE,
     initial_state: Optional[torch.Tensor] = None,
 ):
     """Chunk-parallel gated delta rule with the inter-chunk recurrence in NKI.
@@ -548,10 +557,13 @@ def nki_chunk_gated_delta_rule(
     attn_intra_t = attn_intra.transpose(-1, -2).contiguous()
     value = value.contiguous()
     k_decay = k_decay.contiguous()
-    g_last = g_last.contiguous()
 
-    core_flat, final_state_flat = nki_chunk_gated_delta_rule_kernel(
-        value, k_cumdecay_t, qg_t, attn_intra_t, k_decay, g_last, init_state
+    # Pre-broadcast exp(g_last) from [BH, NC] to [BH, NC, Dk] on the host,
+    # eliminating 3 NKI instructions/chunk (scalar DMA + nc_matmul + copy).
+    g_last_bc = g_last.unsqueeze(-1).expand(-1, -1, k_head_dim).contiguous()
+
+    core_flat, final_state_flat = nki_chunk_gated_delta_rule_kernel_v2(
+        value, k_cumdecay_t, qg_t, attn_intra_t, k_decay, g_last_bc, init_state
     )
 
     core_attn_out = core_flat.reshape(batch_size, num_heads, total_sequence_length, v_head_dim)

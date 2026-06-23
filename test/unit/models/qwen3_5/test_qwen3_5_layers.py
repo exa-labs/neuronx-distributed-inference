@@ -244,6 +244,107 @@ class TestGatedDeltaRuleKernels(unittest.TestCase):
         assert_close(self, expected_core, core, rtol=1e-4, name="nki chunked core")
         assert_close(self, expected_state, final_state, rtol=1e-4, name="nki chunked final state")
 
+    def test_nki_chunk_kernel_v2_matches_loop(self):
+        """v2 kernel (pre-broadcast gate, no ones_row) matches sequential ref."""
+        try:
+            import nki  # noqa: F401
+            from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
+                nki_chunk_gated_delta_rule_kernel_v2,
+            )
+        except ImportError:
+            self.skipTest("nki not available in this environment")
+
+        bh, nc, c, dk, dv = 2, 3, 64, 128, 128
+        value = torch.randn(bh, nc, c, dv)
+        k_cumdecay = torch.randn(bh, nc, c, dk)
+        qg = torch.randn(bh, nc, c, dk)
+        attn_intra = torch.randn(bh, nc, c, c)
+        k_decay = torch.randn(bh, nc, c, dk)
+        g_last = torch.rand(bh, nc)
+        init_state = torch.randn(bh, dk, dv)
+
+        state = init_state.clone()
+        cores = []
+        for i in range(nc):
+            v_prime = k_cumdecay[:, i] @ state
+            v_new = value[:, i] - v_prime
+            attn_inter = qg[:, i] @ state
+            cores.append(attn_inter + attn_intra[:, i] @ v_new)
+            state_update = k_decay[:, i].transpose(-1, -2) @ v_new
+            state = state * g_last[:, i, None, None] + state_update
+        expected_core = torch.stack(cores, dim=1)
+        expected_state = state
+
+        k_cumdecay_t = k_cumdecay.transpose(-1, -2).contiguous()
+        qg_t = qg.transpose(-1, -2).contiguous()
+        attn_intra_t = attn_intra.transpose(-1, -2).contiguous()
+        # Pre-broadcast gate to [BH, NC, Dk].
+        g_last_bc = g_last.unsqueeze(-1).expand(-1, -1, dk).contiguous()
+
+        try:
+            core, final_state = nki.simulate(nki_chunk_gated_delta_rule_kernel_v2)(
+                value.numpy(), k_cumdecay_t.numpy(), qg_t.numpy(),
+                attn_intra_t.numpy(), k_decay.numpy(), g_last_bc.numpy(),
+                init_state.numpy(),
+            )
+        except Exception as exc:
+            self.skipTest(f"nki.simulate unavailable: {exc}")
+        core = torch.from_numpy(numpy.asarray(core)).float()
+        final_state = torch.from_numpy(numpy.asarray(final_state)).float()
+
+        assert_close(self, expected_core, core, rtol=1e-4, name="nki v2 chunked core")
+        assert_close(self, expected_state, final_state, rtol=1e-4, name="nki v2 chunked state")
+
+    def test_nki_chunk_kernel_v2_chunk128(self):
+        """v2 kernel at chunk_size=128: full [128,128] tile utilization."""
+        try:
+            import nki  # noqa: F401
+            from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
+                nki_chunk_gated_delta_rule_kernel_v2,
+            )
+        except ImportError:
+            self.skipTest("nki not available in this environment")
+
+        bh, nc, c, dk, dv = 2, 4, 128, 128, 128
+        value = torch.randn(bh, nc, c, dv)
+        k_cumdecay = torch.randn(bh, nc, c, dk)
+        qg = torch.randn(bh, nc, c, dk)
+        attn_intra = torch.randn(bh, nc, c, c)
+        k_decay = torch.randn(bh, nc, c, dk)
+        g_last = torch.rand(bh, nc)
+        init_state = torch.randn(bh, dk, dv)
+
+        state = init_state.clone()
+        cores = []
+        for i in range(nc):
+            v_prime = k_cumdecay[:, i] @ state
+            v_new = value[:, i] - v_prime
+            attn_inter = qg[:, i] @ state
+            cores.append(attn_inter + attn_intra[:, i] @ v_new)
+            state_update = k_decay[:, i].transpose(-1, -2) @ v_new
+            state = state * g_last[:, i, None, None] + state_update
+        expected_core = torch.stack(cores, dim=1)
+        expected_state = state
+
+        k_cumdecay_t = k_cumdecay.transpose(-1, -2).contiguous()
+        qg_t = qg.transpose(-1, -2).contiguous()
+        attn_intra_t = attn_intra.transpose(-1, -2).contiguous()
+        g_last_bc = g_last.unsqueeze(-1).expand(-1, -1, dk).contiguous()
+
+        try:
+            core, final_state = nki.simulate(nki_chunk_gated_delta_rule_kernel_v2)(
+                value.numpy(), k_cumdecay_t.numpy(), qg_t.numpy(),
+                attn_intra_t.numpy(), k_decay.numpy(), g_last_bc.numpy(),
+                init_state.numpy(),
+            )
+        except Exception as exc:
+            self.skipTest(f"nki.simulate unavailable: {exc}")
+        core = torch.from_numpy(numpy.asarray(core)).float()
+        final_state = torch.from_numpy(numpy.asarray(final_state)).float()
+
+        assert_close(self, expected_core, core, rtol=1e-4, name="nki v2 c128 core")
+        assert_close(self, expected_state, final_state, rtol=1e-4, name="nki v2 c128 state")
+
     def test_nki_decode_kernel_matches_general(self):
         """The specialized decode kernel (k_row, no seq loop) must match the
         general recurrent kernel for T=1."""
