@@ -1760,20 +1760,31 @@ class NeuronQwen3_5ForCausalLM(NeuronBaseForCausalLM):
         # function-call overhead in Modular flow (same rationale as
         # model_wrapper line 126-128).  Fall back to -O1 when using the
         # torch decode path where the scan DAG is visible.
+        #
+        # --enable-mixed-precision-accumulation: bf16 accumulation in tensor-
+        # engine matmuls (FFN, attention projections).  ~2× FLOP throughput
+        # with negligible precision loss for inference.  Safe because model
+        # weights are already bf16 and NKI kernels specify their own
+        # accumulation precision (fp32) independently.
+        #
         # NOTE: we include --verify-hlo=true here because model_wrapper skips its
         # own --internal-hlo2tensorizer-options when we already provide one.
         hlo2t = "--internal-hlo2tensorizer-options='--modular-flow-mac-threshold=10 --verify-hlo=true'"
-        tkg_opt = "-O2" if (_USE_NKI_DELTA_RULE and is_tkg) else "-O1"
+        # -O2 for TKG needs ~40GiB compile RAM; use -O1 by default, allow
+        # override via QWEN35_TKG_OPT_LEVEL env for experimentation.
+        tkg_opt_level = os.environ.get("QWEN35_TKG_OPT_LEVEL", "-O1")
+        tkg_opt = tkg_opt_level if is_tkg else "-O1"
+        mpa = "--enable-mixed-precision-accumulation"
         if is_tkg:
             return (
-                "--auto-cast=none --model-type=transformer "
+                f"--auto-cast=none --model-type=transformer {mpa} "
                 f"{hlo2t} "
                 f"--lnc={self.neuron_config.logical_nc_config} {tkg_opt}"
             )
         # CTE: use ccop overlap with tiling-factor=2 for compute-communication
         # pipelining during long prefill passes.
         return (
-            "--auto-cast=none --model-type=transformer "
+            f"--auto-cast=none --model-type=transformer {mpa} "
             "--tensorizer-options='--enable-ccop-compute-overlap "
             "--cc-pipeline-tiling-factor=2 --vectorize-strided-dma ' "
             f"{hlo2t} "
