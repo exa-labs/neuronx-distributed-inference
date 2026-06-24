@@ -1787,7 +1787,10 @@ class NeuronQwen3_5ForCausalLM(NeuronBaseForCausalLM):
         # override via QWEN35_TKG_OPT_LEVEL env for experimentation.
         tkg_opt_level = os.environ.get("QWEN35_TKG_OPT_LEVEL", "-O1")
         tkg_opt = tkg_opt_level if is_tkg else "-O1"
-        mpa = "--enable-mixed-precision-accumulation"
+        # Mixed-precision accumulation: bf16 TensorEngine accumulation for FFN
+        # and attention projections.  NKI kernels specify their own (fp32).
+        # Disable via QWEN35_DISABLE_MPA=1 for A/B testing.
+        mpa = "" if os.environ.get("QWEN35_DISABLE_MPA", "0") == "1" else "--enable-mixed-precision-accumulation"
         if is_tkg:
             return (
                 f"--auto-cast=none --model-type=transformer {mpa} "
