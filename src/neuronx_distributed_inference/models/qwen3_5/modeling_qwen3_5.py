@@ -33,6 +33,7 @@ can be validated against the HF CPU model.
 """
 
 import gc
+import math
 import os
 from typing import List, Optional, Tuple
 
@@ -539,24 +540,21 @@ def nki_chunk_gated_delta_rule(
     rhs2 = k_beta * g.exp().unsqueeze(-1)
 
     if _DELTANET_UT_MODE == "neumann":
-        # Repeated squaring: (I-L)^{-1} = (I+L)(I+L^2)(I+L^4)...(I+L^{2^k})
-        # For C=64: k=5 (since L^64=0 for strictly-lower-triangular L).
-        # 5 squarings + 5 products + 2 applications = 12 batched matmuls total,
-        # replacing 63 sequential XLA-traced loop steps.
+        # Repeated squaring: (I-L)^{-1} = prod_{k=0}^{n-1} (I + L^{2^k})
+        # where n = ceil(log2(C)).  For strictly-lower-triangular L of size C,
+        # L^C = 0, so the product is exact when 2^n >= C.
+        # n squarings + n products + 2 applications matmuls total (n=6 for C=64,
+        # n=7 for C=128), replacing C-1 sequential XLA-traced loop steps.
+        num_levels = int(math.ceil(math.log2(chunk_size)))
         eye = torch.eye(chunk_size, dtype=L.dtype, device=L.device)
         # Compute powers of L via repeated squaring
-        L2 = L @ L
-        L4 = L2 @ L2
-        L8 = L4 @ L4
-        L16 = L8 @ L8
-        L32 = L16 @ L16
+        powers = [L]
+        for _ in range(num_levels - 1):
+            powers.append(powers[-1] @ powers[-1])
         # Accumulate the Neumann series as a product of factors
-        inv = eye + L
-        inv = inv @ (eye + L2)
-        inv = inv @ (eye + L4)
-        inv = inv @ (eye + L8)
-        inv = inv @ (eye + L16)
-        inv = inv @ (eye + L32)
+        inv = eye + powers[0]
+        for p in powers[1:]:
+            inv = inv @ (eye + p)
         # Apply the inverse to both RHS vectors
         value = inv @ v_beta
         k_cumdecay = inv @ rhs2
