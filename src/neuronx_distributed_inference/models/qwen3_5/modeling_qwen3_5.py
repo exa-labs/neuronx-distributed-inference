@@ -1754,17 +1754,21 @@ class NeuronQwen3_5ForCausalLM(NeuronBaseForCausalLM):
     def get_compiler_args(self):
         is_tkg = getattr(self, "compile_tag", None) == TOKEN_GENERATION_MODEL_TAG
         # DeltaNet's recurrent scan DAG triggers PGTiling (NCC_IPCC901) at
-        # batch=14.  Force aggressive modular-flow partitioning (mac-threshold=10)
-        # so the graph is split into small modules where no single module has the
-        # problematic multi-axis DAG configuration that PGTiling rejects.
+        # batch=14 under -O2.  With the NKI decode kernel active, the
+        # recurrence is an opaque kernel call invisible to the compiler, so
+        # PGTiling no longer fires and we can use -O2 for TKG to avoid
+        # function-call overhead in Modular flow (same rationale as
+        # model_wrapper line 126-128).  Fall back to -O1 when using the
+        # torch decode path where the scan DAG is visible.
         # NOTE: we include --verify-hlo=true here because model_wrapper skips its
         # own --internal-hlo2tensorizer-options when we already provide one.
         hlo2t = "--internal-hlo2tensorizer-options='--modular-flow-mac-threshold=10 --verify-hlo=true'"
+        tkg_opt = "-O2" if (_USE_NKI_DELTA_RULE and is_tkg) else "-O1"
         if is_tkg:
             return (
                 "--auto-cast=none --model-type=transformer "
                 f"{hlo2t} "
-                f"--lnc={self.neuron_config.logical_nc_config} -O1"
+                f"--lnc={self.neuron_config.logical_nc_config} {tkg_opt}"
             )
         # CTE: use ccop overlap with tiling-factor=2 for compute-communication
         # pipelining during long prefill passes.
