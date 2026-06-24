@@ -54,6 +54,7 @@ try:
         nki_recurrent_gated_delta_rule_decode_v3,
         nki_recurrent_gated_delta_rule_decode_v4,
         nki_recurrent_gated_delta_rule_decode_v4_bf16,
+        nki_recurrent_gated_delta_rule_decode_v5_bf16,
         nki_within_chunk_state_update,
     )
     _NKI_AVAILABLE = True
@@ -169,7 +170,7 @@ _DELTANET_DECODE_KERNEL = os.environ.get("QWEN35_DELTANET_DECODE_KERNEL", "nki_v
 # Automatically set to "bf16" when DECODE_KERNEL uses bf16 state.
 _DELTANET_STATE_DTYPE = os.environ.get(
     "QWEN35_DELTANET_STATE_DTYPE",
-    "bf16" if _DELTANET_DECODE_KERNEL in ("nki_v2_bf16", "nki_v4_bf16") else "fp32",
+    "bf16" if _DELTANET_DECODE_KERNEL in ("nki_v2_bf16", "nki_v4_bf16", "nki_v5_bf16") else "fp32",
 )
 
 from neuronx_distributed.parallel_layers import parallel_state
@@ -742,11 +743,23 @@ def nki_gated_delta_rule(
         k_col = k_f32.unsqueeze(-1).contiguous()  # [BH, Dk, 1]
         state_flat = initial_state.reshape(bh, k_head_dim, v_head_dim)
         # For non-bf16 kernels, ensure state is fp32 (buffer may be bf16)
-        if _DELTANET_DECODE_KERNEL not in ("nki_v2_bf16", "nki_v4_bf16"):
+        if _DELTANET_DECODE_KERNEL not in ("nki_v2_bf16", "nki_v4_bf16", "nki_v5_bf16"):
             state_flat = state_flat.to(torch.float32)
         state_flat = state_flat.contiguous()
 
-        if _DELTANET_DECODE_KERNEL == "nki_v4_bf16":
+        if _DELTANET_DECODE_KERNEL == "nki_v5_bf16":
+            # v5_bf16: rank-1 decomposition + parallel_range + bf16 state
+            exp_g_bc = exp_g_flat.unsqueeze(-1).expand(-1, k_head_dim).contiguous()
+            k_beta = k_f32 * beta_flat.unsqueeze(-1)  # [BH, Dk]
+            k_beta_col = k_beta.unsqueeze(-1).contiguous()  # [BH, Dk, 1]
+            k_beta_row = k_beta.unsqueeze(1).contiguous()   # [BH, 1, Dk]
+            v_row = v_f32.unsqueeze(1).contiguous()  # [BH, 1, Dv]
+            state_bf16 = state_flat.to(torch.bfloat16).contiguous()
+
+            out_flat, final_state_flat = nki_recurrent_gated_delta_rule_decode_v5_bf16(
+                q_col, k_col, k_beta_col, k_beta_row, v_row, exp_g_bc, state_bf16
+            )
+        elif _DELTANET_DECODE_KERNEL == "nki_v4_bf16":
             # v4_bf16: parallel_range + bf16 state (multiplicative DMA savings)
             exp_g_bc = exp_g_flat.unsqueeze(-1).expand(-1, k_head_dim).contiguous()
             k_beta_row = (k_f32 * beta_flat.unsqueeze(-1)).unsqueeze(1).contiguous()

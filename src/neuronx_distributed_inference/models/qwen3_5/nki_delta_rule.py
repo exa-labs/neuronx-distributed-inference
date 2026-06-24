@@ -1009,3 +1009,114 @@ def nki_chunk_gated_delta_rule_kernel_v2(
         nisa.dma_copy(dst=final_state_ref[idx, :, :], src=state)
 
     return out_ref, final_state_ref
+
+
+@nki.jit(mode="torchxla")
+def nki_recurrent_gated_delta_rule_decode_v5_bf16(
+    q_ref, k_ref, k_beta_col_ref, k_beta_row_ref, v_ref, exp_g_bc_ref, state_ref
+):
+    """Decode kernel v5: rank-1 decomposition + parallel_range + bf16 state.
+
+    Combines all three orthogonal optimisations:
+      1. v3's rank-1 algebraic trick: output = q^T@state_scaled + dot(q,k*beta)*delta
+         Decouples q_matmul from state update -> shorter critical path.
+      2. v4's parallel_range: BH iterations are independent so the compiler
+         overlaps DMA of head N+1 with compute of head N.
+      3. bf16 state: halves the dominant [128,128] DMA (32KB vs 64KB per tile).
+
+    Critical path per head (4-deep vs v2's 6):
+      state_scale -> {k_matmul, q_matmul} -> delta -> {outer || correction} -> output
+
+    Args:
+        q_ref:          [BH, Dk, 1]  queries (column-major, l2-normed+scaled)
+        k_ref:          [BH, Dk, 1]  keys (column-major, for k^T @ state)
+        k_beta_col_ref: [BH, Dk, 1]  keys * beta (column-major, for dot product)
+        k_beta_row_ref: [BH, 1, Dk]  keys * beta (row-major, for outer product)
+        v_ref:          [BH, 1, Dv]  values (row-major)
+        exp_g_bc_ref:   [BH, Dk]     exp(g) broadcast to Dk
+        state_ref:      [BH, Dk, Dv] initial state (bf16)
+
+    Returns:
+        out_ref:         [BH, 1, Dv]  output (row-major, fp32)
+        final_state_ref: [BH, Dk, Dv] final state (bf16)
+    """
+    bh = q_ref.shape[0]
+    dk = q_ref.shape[1]   # Dk = 128
+    dv = v_ref.shape[2]   # Dv = 128
+
+    out_ref = nl.ndarray((bh, 1, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+    final_state_ref = nl.ndarray((bh, dk, dv), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    # parallel_range: heads are independent, compiler overlaps DMA/compute
+    for idx in nl.parallel_range(bh):
+        # Load state as bf16 from HBM, cast to fp32 in SBUF
+        state_bf16 = nl.ndarray((dk, dv), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=state_bf16, src=state_ref[idx, :, :])
+        state = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(state, state_bf16, nl.multiply, 1.0)
+
+        q_t = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=q_t, src=q_ref[idx, :, :])
+
+        k_t = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=k_t, src=k_ref[idx, :, :])
+
+        k_beta_col = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=k_beta_col, src=k_beta_col_ref[idx, :, :])
+
+        k_beta_row = nl.ndarray((1, dk), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=k_beta_row, src=k_beta_row_ref[idx, :, :])
+
+        v_t = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=v_t, src=v_ref[idx, :, :])
+
+        exp_g_bc = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=exp_g_bc, src=exp_g_bc_ref[idx, :])
+
+        # -- Step 1: state *= exp(g) --
+        nisa.tensor_scalar(state, state, nl.multiply, exp_g_bc)
+
+        # -- Step 2: kv_mem = k^T @ state -> [1, Dv] --
+        kv_psum = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(kv_psum, k_t, state)
+        kv_mem = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(kv_mem, kv_psum)
+
+        # -- Step 3: q_state = q^T @ state -> [1, Dv] (BEFORE state update!)
+        q_psum = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(q_psum, q_t, state)
+        q_state = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(q_state, q_psum)
+
+        # -- Step 4: delta = v - kv_mem -> [1, Dv] --
+        delta = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(delta, v_t, kv_mem, op=nl.subtract)
+
+        # -- Step 5: state += outer(k*beta, delta) -> [Dk, Dv] --
+        outer_psum = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(outer_psum, k_beta_row, delta)
+        outer = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(outer, outer_psum)
+        nisa.tensor_tensor(state, state, outer, op=nl.add)
+
+        # -- Step 6: dot(q, k*beta) -> scalar --
+        dot_psum = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(dot_psum, q_t, k_beta_col)
+        dot_val = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dot_val, dot_psum)
+
+        # -- Step 7: correction = dot_val * delta -> [1, Dv] --
+        correction = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(correction, delta, nl.multiply, dot_val)
+
+        # -- Step 8: output = q_state + correction --
+        out_sbuf = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(out_sbuf, q_state, correction, op=nl.add)
+
+        # Store output (fp32) and state (bf16)
+        nisa.dma_copy(dst=out_ref[idx, :, :], src=out_sbuf)
+        state_out_bf16 = nl.ndarray((dk, dv), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_scalar(state_out_bf16, state, nl.multiply, 1.0)
+        nisa.dma_copy(dst=final_state_ref[idx, :, :], src=state_out_bf16)
+
+    return out_ref, final_state_ref
