@@ -679,8 +679,8 @@ def nki_recurrent_gated_delta_rule_decode_v4_bf16(
     out_ref = nl.ndarray((bh, 1, dv), dtype=nl.float32, buffer=nl.shared_hbm)
     final_state_ref = nl.ndarray((bh, dk, dv), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    # parallel_range: each head is independent, compiler overlaps DMA/compute
-    for idx in nl.parallel_range(bh):
+    # affine_range: sequential iteration (parallel_range crashes in-model trace)
+    for idx in nl.affine_range(bh):
         # Load state as bf16 from HBM, cast to fp32 in SBUF for computation
         state_bf16 = nl.ndarray((dk, dv), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.dma_copy(dst=state_bf16, src=state_ref[idx, :, :])
@@ -1015,14 +1015,15 @@ def nki_chunk_gated_delta_rule_kernel_v2(
 def nki_recurrent_gated_delta_rule_decode_v5_bf16(
     q_ref, k_ref, k_beta_col_ref, k_beta_row_ref, v_ref, exp_g_bc_ref, state_ref
 ):
-    """Decode kernel v5: rank-1 decomposition + parallel_range + bf16 state.
+    """Decode kernel v5: rank-1 decomposition + bf16 state.
 
-    Combines all three orthogonal optimisations:
+    Combines two orthogonal optimisations:
       1. v3's rank-1 algebraic trick: output = q^T@state_scaled + dot(q,k*beta)*delta
          Decouples q_matmul from state update -> shorter critical path.
-      2. v4's parallel_range: BH iterations are independent so the compiler
-         overlaps DMA of head N+1 with compute of head N.
-      3. bf16 state: halves the dominant [128,128] DMA (32KB vs 64KB per tile).
+      2. bf16 state: halves the dominant [128,128] DMA (32KB vs 64KB per tile).
+
+    Note: parallel_range crashes during in-model trace on neuronx-cc, so we use
+    affine_range.  The rank-1 trick is the primary speedup (shorter critical path).
 
     Critical path per head (4-deep vs v2's 6):
       state_scale -> {k_matmul, q_matmul} -> delta -> {outer || correction} -> output
@@ -1047,8 +1048,8 @@ def nki_recurrent_gated_delta_rule_decode_v5_bf16(
     out_ref = nl.ndarray((bh, 1, dv), dtype=nl.float32, buffer=nl.shared_hbm)
     final_state_ref = nl.ndarray((bh, dk, dv), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    # parallel_range: heads are independent, compiler overlaps DMA/compute
-    for idx in nl.parallel_range(bh):
+    # affine_range: sequential iteration (parallel_range crashes in-model trace)
+    for idx in nl.affine_range(bh):
         # Load state as bf16 from HBM, cast to fp32 in SBUF
         state_bf16 = nl.ndarray((dk, dv), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.dma_copy(dst=state_bf16, src=state_ref[idx, :, :])
