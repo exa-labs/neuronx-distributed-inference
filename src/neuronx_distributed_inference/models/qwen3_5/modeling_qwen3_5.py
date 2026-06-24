@@ -51,6 +51,7 @@ try:
         nki_recurrent_gated_delta_rule_decode,
         nki_recurrent_gated_delta_rule_decode_v2,
         nki_recurrent_gated_delta_rule_decode_v3,
+        nki_recurrent_gated_delta_rule_decode_v4,
         nki_within_chunk_state_update,
     )
     _NKI_AVAILABLE = True
@@ -728,7 +729,16 @@ def nki_gated_delta_rule(
         k_col = k_f32.unsqueeze(-1).contiguous()  # [BH, Dk, 1]
         state_flat = initial_state.reshape(bh, k_head_dim, v_head_dim).contiguous()
 
-        if _DELTANET_DECODE_KERNEL == "nki_v3":
+        if _DELTANET_DECODE_KERNEL == "nki_v4":
+            # v4: parallel_range — compiler overlaps DMA/compute across heads
+            exp_g_bc = exp_g_flat.unsqueeze(-1).expand(-1, k_head_dim).contiguous()
+            k_beta_row = (k_f32 * beta_flat.unsqueeze(-1)).unsqueeze(1).contiguous()
+            v_row = v_f32.unsqueeze(1).contiguous()  # [BH, 1, Dv]
+
+            out_flat, final_state_flat = nki_recurrent_gated_delta_rule_decode_v4(
+                q_col, k_col, k_beta_row, v_row, exp_g_bc, state_flat
+            )
+        elif _DELTANET_DECODE_KERNEL == "nki_v3":
             # v3: fused kq matmul + algebraic output (rank-1 decomposition)
             # Eliminates critical-path dependency: output computed without waiting
             # for state update, enabling better instruction pipelining.
