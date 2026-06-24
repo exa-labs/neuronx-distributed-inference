@@ -353,22 +353,26 @@ def nki_recurrent_gated_delta_rule_decode_v2(
 def nki_recurrent_gated_delta_rule_decode_v3(
     q_ref, k_ref, k_beta_col_ref, k_beta_row_ref, v_ref, exp_g_bc_ref, state_ref
 ):
-    """Decode kernel v3: fused q/k matmul + algebraic output (rank-1 decomposition).
+    """Decode kernel v3: rank-1 decomposition breaks critical-path dependency.
 
     Key algebraic insight: the state update ``outer(k*beta, delta)`` is rank-1, so
     ``q^T @ state_new = q^T @ state_scaled + dot(q, k*beta) * delta``.
-    This eliminates the critical-path dependency of the output computation on the
-    full state update, enabling the compiler to pipeline state-write and output-write
-    independently. Also fuses the k^T@state and q^T@state matmuls into a single
-    [K=Dk, M=2]^T @ [K=Dk, N=Dv] operation, saving one nc_matmul dispatch.
+    This lets us compute q^T@state BEFORE the state update completes, decoupling
+    the output computation from the state-write path.
 
-    Net savings vs v2: −1 nc_matmul (output), −1 tensor_copy, shorter critical path.
-    Adds 1 nc_matmul([1,1] dot product) + 1 tensor_scalar + 1 tensor_tensor, but
-    these are tiny ops (scalar/vector) vs the eliminated [128,128] mat-vec.
+    Critical path comparison:
+      v2: state_scale → k_matmul → delta → outer → **q_matmul** (5 sequential)
+      v3: state_scale → {k_matmul, q_matmul} → delta → {outer || correction} → output
+    The q_matmul moves before the state update; output uses an algebraic correction
+    instead of reading the updated state.  The compiler can pipeline the state-write
+    (step 5) with the output correction (steps 6-8) since they're independent.
+
+    Matmul count: 4 (k^T@s, q^T@s, outer, dot) vs v2's 3. The extra dot is [1,1]
+    (trivial) and the critical-path shortening dominates.
 
     Args:
         q_ref:          [BH, Dk, 1]  queries (column-major, l2-normed+scaled)
-        k_ref:          [BH, Dk, 1]  keys (column-major, for fused kq matmul)
+        k_ref:          [BH, Dk, 1]  keys (column-major, for k^T @ state)
         k_beta_col_ref: [BH, Dk, 1]  keys * beta (column-major, for dot product)
         k_beta_row_ref: [BH, 1, Dk]  keys * beta (row-major, for outer product)
         v_ref:          [BH, 1, Dv]  values (row-major)
@@ -412,50 +416,44 @@ def nki_recurrent_gated_delta_rule_decode_v3(
         # ── Step 1: state *= exp(g) ──────────────────────────────────────
         nisa.tensor_scalar(state, state, nl.multiply, exp_g_bc)
 
-        # ── Step 2: fused kv_mem + q_state = [k; q]^T @ state ───────────
-        # Stack k and q into [Dk, 2] then matmul against state [Dk, Dv]
-        # nc_matmul: out[M, N] = A[K, M]^T @ B[K, N]
-        # A = kq_stacked[128, 2], B = state[128, 128] → out[2, 128]
-        kq_stacked = nl.ndarray((dk, 2), dtype=nl.float32, buffer=nl.sbuf)
-        kq_stacked[:, 0] = nl.copy(k_t[:, 0], dtype=nl.float32)
-        kq_stacked[:, 1] = nl.copy(q_t[:, 0], dtype=nl.float32)
-
-        kq_psum = nl.ndarray((2, dv), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(kq_psum, kq_stacked, state)
-        kq_result = nl.ndarray((2, dv), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(kq_result, kq_psum)
-
-        # Extract kv_mem[1, Dv] and q_state[1, Dv]
+        # ── Step 2: kv_mem = k^T @ state → [1, Dv] ──────────────────────
+        kv_psum = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(kv_psum, k_t, state)
         kv_mem = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
-        kv_mem[0, :] = nl.copy(kq_result[0, :], dtype=nl.float32)
-        q_state = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
-        q_state[0, :] = nl.copy(kq_result[1, :], dtype=nl.float32)
+        nisa.tensor_copy(kv_mem, kv_psum)
 
-        # ── Step 3: delta = v - kv_mem → [1, Dv] ────────────────────────
+        # ── Step 3: q_state = q^T @ state → [1, Dv] (BEFORE state update!)
+        # This reads the scaled state before the rank-1 update; the output
+        # correction (step 7) accounts for the missing outer product term.
+        q_psum = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(q_psum, q_t, state)
+        q_state = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(q_state, q_psum)
+
+        # ── Step 4: delta = v - kv_mem → [1, Dv] ────────────────────────
         delta = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(delta, v_t, kv_mem, op=nl.subtract)
 
-        # ── Step 4: state += outer(k*beta, delta) → [Dk, Dv] ────────────
-        # (state update path — independent of output computation)
+        # ── Step 5: state += outer(k*beta, delta) → [Dk, Dv] ────────────
+        # (state update path — independent of output computation below)
         outer_psum = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(outer_psum, k_beta_row, delta)
         outer = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(outer, outer_psum)
         nisa.tensor_tensor(state, state, outer, op=nl.add)
 
-        # ── Step 5: output = q_state + dot(q, k*beta) * delta ────────────
-        # dot(q, k*beta) as a [1,1] matmul: q_t[Dk,1]^T @ k_beta_col[Dk,1]
-        # nc_matmul: out[1,1] = q_t[128,1]^T @ k_beta_col[128,1]
+        # ── Step 6: dot(q, k*beta) → scalar ─────────────────────────────
+        # q_t[Dk,1]^T @ k_beta_col[Dk,1] → [1,1]
         dot_psum = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dot_psum, q_t, k_beta_col)
         dot_val = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dot_val, dot_psum)
 
-        # correction = dot_val * delta → [1, Dv] (scalar broadcast)
+        # ── Step 7: correction = dot_val * delta → [1, Dv] ──────────────
         correction = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(correction, delta, nl.multiply, dot_val)
 
-        # output = q_state + correction
+        # ── Step 8: output = q_state + correction ────────────────────────
         out_sbuf = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(out_sbuf, q_state, correction, op=nl.add)
 
