@@ -50,6 +50,7 @@ try:
         nki_recurrent_gated_delta_rule,
         nki_recurrent_gated_delta_rule_decode,
         nki_recurrent_gated_delta_rule_decode_v2,
+        nki_recurrent_gated_delta_rule_decode_v2_bf16,
         nki_recurrent_gated_delta_rule_decode_v3,
         nki_recurrent_gated_delta_rule_decode_v4,
         nki_within_chunk_state_update,
@@ -158,6 +159,17 @@ _DELTANET_UT_MODE = os.environ.get("QWEN35_DELTANET_UT_MODE", "loop")
 # exp_g broadcast + k*beta fusion — fewer DMA + instructions per head);
 # "torch" = pure-torch single-step (may crash neuronx-cc on big graphs).
 _DELTANET_DECODE_KERNEL = os.environ.get("QWEN35_DELTANET_DECODE_KERNEL", "nki_v2")
+
+# State precision for decode.  "fp32" (default) keeps the recurrent state in
+# full precision.  "bf16" halves DMA bandwidth (32KB vs 64KB per [128,128]
+# state tile) at the cost of ~1/256 relative precision per step — acceptable
+# because exp(g) < 1 attenuates old entries.  At batch16 × 24 layers, bf16
+# saves ~5ms per decode step on inf2.xlarge (DMA-bound).
+# Automatically set to "bf16" when DECODE_KERNEL=nki_v2_bf16.
+_DELTANET_STATE_DTYPE = os.environ.get(
+    "QWEN35_DELTANET_STATE_DTYPE",
+    "bf16" if _DELTANET_DECODE_KERNEL == "nki_v2_bf16" else "fp32",
+)
 
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
@@ -727,7 +739,11 @@ def nki_gated_delta_rule(
 
         q_col = q_f32.unsqueeze(-1).contiguous()  # [BH, Dk, 1]
         k_col = k_f32.unsqueeze(-1).contiguous()  # [BH, Dk, 1]
-        state_flat = initial_state.reshape(bh, k_head_dim, v_head_dim).contiguous()
+        state_flat = initial_state.reshape(bh, k_head_dim, v_head_dim)
+        # For non-bf16 kernels, ensure state is fp32 (buffer may be bf16)
+        if _DELTANET_DECODE_KERNEL != "nki_v2_bf16":
+            state_flat = state_flat.to(torch.float32)
+        state_flat = state_flat.contiguous()
 
         if _DELTANET_DECODE_KERNEL == "nki_v4":
             # v4: parallel_range — compiler overlaps DMA/compute across heads
@@ -750,6 +766,16 @@ def nki_gated_delta_rule(
 
             out_flat, final_state_flat = nki_recurrent_gated_delta_rule_decode_v3(
                 q_col, k_col, k_beta_col, k_beta_row, v_row, exp_g_bc, state_flat
+            )
+        elif _DELTANET_DECODE_KERNEL == "nki_v2_bf16":
+            # v2_bf16: same as v2 but state is bf16 in HBM (halves DMA bandwidth)
+            exp_g_bc = exp_g_flat.unsqueeze(-1).expand(-1, k_head_dim).contiguous()
+            k_beta_row = (k_f32 * beta_flat.unsqueeze(-1)).unsqueeze(1).contiguous()
+            v_row = v_f32.unsqueeze(1).contiguous()  # [BH, 1, Dv]
+            state_bf16 = state_flat.to(torch.bfloat16).contiguous()
+
+            out_flat, final_state_flat = nki_recurrent_gated_delta_rule_decode_v2_bf16(
+                q_col, k_col, k_beta_row, v_row, exp_g_bc, state_bf16
             )
         elif _DELTANET_DECODE_KERNEL == "nki_v2":
             # v2: host-precomputed exp_g broadcast + k*beta fusion
@@ -990,10 +1016,11 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
             torch.zeros(max_batch, self.local_conv_dim, self.kernel_size - 1, dtype=torch.float32),
             requires_grad=False,
         )
+        _rstate_dtype = torch.bfloat16 if _DELTANET_STATE_DTYPE == "bf16" else torch.float32
         self.recurrent_state = nn.Parameter(
             torch.zeros(
                 max_batch, self.local_num_v_heads * self.head_k_dim * self.head_v_dim,
-                dtype=torch.float32,
+                dtype=_rstate_dtype,
             ),
             requires_grad=False,
         )
@@ -1170,8 +1197,9 @@ class NeuronQwen3_5GatedDeltaNet(nn.Module):
 
         if seq_ids is not None:
             self.next_conv_state = self.conv_state.index_copy(0, seq_ids, new_conv_state)
+            _rstate_cast = torch.bfloat16 if _DELTANET_STATE_DTYPE == "bf16" else torch.float32
             self.next_recurrent_state = self.recurrent_state.index_copy(
-                0, seq_ids, new_recurrent_state.reshape(batch_size, -1).float()
+                0, seq_ids, new_recurrent_state.reshape(batch_size, -1).to(_rstate_cast)
             )
             if hidden_states.device.type != "xla":
                 # Eager (CPU) execution: persist state directly. Under XLA

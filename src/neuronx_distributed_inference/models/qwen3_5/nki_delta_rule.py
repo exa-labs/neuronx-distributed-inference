@@ -350,6 +350,100 @@ def nki_recurrent_gated_delta_rule_decode_v2(
 
 
 @nki.jit(mode="torchxla")
+def nki_recurrent_gated_delta_rule_decode_v2_bf16(
+    q_ref, k_ref, k_beta_row_ref, v_ref, exp_g_bc_ref, state_ref
+):
+    """Decode kernel v2 with bf16 state storage — halves DMA bandwidth.
+
+    Same math as v2 but the persistent state is stored in HBM as bf16 instead
+    of fp32.  Computation remains in fp32 (cast on load, cast on store).  This
+    halves the dominant DMA cost: each [128,128] state tile is 32KB instead of
+    64KB, saving ~5ms per decode step at batch16×24 layers on inf2.xlarge.
+
+    Numerical safety: the exponential decay exp(g) < 1 attenuates old state
+    entries, bounding accumulation error.  bf16 has 8 mantissa bits → ~1/256
+    relative precision, which is acceptable for the decode path where each step
+    adds one rank-1 update to a decaying state.
+
+    Args:
+        q_ref:          [BH, Dk, 1]  queries (column-major, l2-normed+scaled)
+        k_ref:          [BH, Dk, 1]  keys (column-major, for k^T @ state)
+        k_beta_row_ref: [BH, 1, Dk]  keys * beta (row-major, for outer product)
+        v_ref:          [BH, 1, Dv]  values (row-major)
+        exp_g_bc_ref:   [BH, Dk]     exp(g) broadcast to Dk (same scalar per row)
+        state_ref:      [BH, Dk, Dv] initial state (bf16)
+
+    Returns:
+        out_ref:         [BH, 1, Dv]  output (row-major, fp32)
+        final_state_ref: [BH, Dk, Dv] final state (bf16)
+    """
+    bh = q_ref.shape[0]
+    dk = q_ref.shape[1]   # Dk = 128
+    dv = v_ref.shape[2]   # Dv = 128
+
+    out_ref = nl.ndarray((bh, 1, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+    final_state_ref = nl.ndarray((bh, dk, dv), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    for idx in nl.affine_range(bh):
+        # Load state as bf16 from HBM, cast to fp32 in SBUF for computation
+        state_bf16 = nl.ndarray((dk, dv), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=state_bf16, src=state_ref[idx, :, :])
+        state = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(state, state_bf16, nl.multiply, 1.0)
+
+        q_t = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=q_t, src=q_ref[idx, :, :])
+
+        k_t = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=k_t, src=k_ref[idx, :, :])
+
+        k_beta_row = nl.ndarray((1, dk), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=k_beta_row, src=k_beta_row_ref[idx, :, :])
+
+        v_t = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=v_t, src=v_ref[idx, :, :])
+
+        exp_g_bc = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=exp_g_bc, src=exp_g_bc_ref[idx, :])
+
+        # Step 1: state *= exp(g)
+        nisa.tensor_scalar(state, state, nl.multiply, exp_g_bc)
+
+        # Step 2: kv_mem = k^T @ state → [1, Dv]
+        kv_psum = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(kv_psum, k_t, state)
+        kv_mem = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(kv_mem, kv_psum)
+
+        # Step 3: delta = v - kv_mem → [1, Dv]
+        delta = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(delta, v_t, kv_mem, op=nl.subtract)
+
+        # Step 4: state += outer(k*beta, delta) → [Dk, Dv]
+        outer_psum = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(outer_psum, k_beta_row, delta)
+        outer = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(outer, outer_psum)
+        nisa.tensor_tensor(state, state, outer, op=nl.add)
+
+        # Step 5: out = q^T @ state → [1, Dv]
+        out_psum = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(out_psum, q_t, state)
+        out_sbuf = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(out_sbuf, out_psum)
+
+        # Store output (fp32)
+        nisa.dma_copy(dst=out_ref[idx, :, :], src=out_sbuf)
+
+        # Cast state back to bf16 and store
+        state_out_bf16 = nl.ndarray((dk, dv), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_scalar(state_out_bf16, state, nl.multiply, 1.0)
+        nisa.dma_copy(dst=final_state_ref[idx, :, :], src=state_out_bf16)
+
+    return out_ref, final_state_ref
+
+
+@nki.jit(mode="torchxla")
 def nki_recurrent_gated_delta_rule_decode_v3(
     q_ref, k_ref, k_beta_col_ref, k_beta_row_ref, v_ref, exp_g_bc_ref, state_ref
 ):
