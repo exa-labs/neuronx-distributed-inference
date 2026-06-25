@@ -178,7 +178,7 @@ _DELTANET_DECODE_KERNEL = os.environ.get("QWEN35_DELTANET_DECODE_KERNEL", "nki_v
 # Automatically set to "bf16" when DECODE_KERNEL uses bf16 state.
 _DELTANET_STATE_DTYPE = os.environ.get(
     "QWEN35_DELTANET_STATE_DTYPE",
-    "bf16" if _DELTANET_DECODE_KERNEL in ("nki_v2_bf16", "nki_v4_bf16", "nki_v5_bf16") else "fp32",
+    "bf16" if _DELTANET_DECODE_KERNEL in ("nki_v2_bf16", "nki_v4_bf16", "nki_v5_bf16", "nki_v6_bf16") else "fp32",
 )
 
 from neuronx_distributed.parallel_layers import parallel_state
