@@ -739,25 +739,30 @@ def nki_recurrent_gated_delta_rule_decode_v4_bf16(
 
 @nki.jit(mode="torchxla")
 def nki_recurrent_gated_delta_rule_decode_v6_bf16(
-    qk_ref, k_beta_row_ref, k_beta_col_ref, v_ref, exp_g_bc_ref, state_ref
+    q_ref, k_ref, k_beta_row_ref, k_beta_col_ref, v_ref, exp_g_bc_ref, state_ref
 ):
-    """Decode kernel v6: fused q/k matmul + algebraic output decomposition.
+    """Decode kernel v6: algebraic output decomposition (shorter critical path).
 
-    Key optimisation over v4: batches q^T@state and k^T@state into a single
-    nc_matmul by stacking [q, k] as [Dk, 2], reducing the critical path from
-    3 nc_matmul to 2 large TensorEngine ops (the q·k_beta dot is a tiny 1×128×1
-    that barely registers on the TE pipeline).
+    Key optimisation over v4: uses algebraic decomposition so output computation
+    does NOT depend on state update — breaks the data dependency that serializes
+    v4's critical path (k@state → delta → state_update → q@state_new).
 
-    Uses algebraic decomposition:
+    Math:
       state_scaled = state * exp_g
-      [base_out; kv_mem] = [q, k]^T @ state_scaled   (ONE nc_matmul, [Dk,2]@[Dk,Dv])
-      delta = v - kv_mem
-      q_dot_kb = k_beta_col^T @ q_col                 (tiny [Dk,1]@[Dk,1] → [1,1])
-      out = base_out + q_dot_kb * delta               (scalar broadcast)
-      state_new = state_scaled + outer(k_beta, delta) (ONE nc_matmul, [1,Dk]@[1,Dv])
+      base_out = q^T @ state_scaled                   (nc_matmul #1)
+      kv_mem   = k^T @ state_scaled                   (nc_matmul #2)
+      delta    = v - kv_mem
+      q_dot_kb = k_beta_col^T @ q_col                 (nc_matmul #3, tiny [Dk,1]@[Dk,1])
+      out      = base_out + q_dot_kb * delta           (scalar ops, no matmul)
+      state_new = state_scaled + outer(k_beta, delta) (nc_matmul #4)
+
+    Output path: #1 + #2 → delta → out (independent of #4)
+    State path: #2 → delta → #4
+    Pipeline benefit: #4 can overlap with output store; #1 is independent of #2.
 
     Args:
-        qk_ref:          [BH, Dk, 2]  stacked queries+keys (column-major)
+        q_ref:           [BH, Dk, 1]  queries (column-major)
+        k_ref:           [BH, Dk, 1]  keys (column-major)
         k_beta_row_ref:  [BH, 1, Dk]  keys * beta (row-major, for outer product)
         k_beta_col_ref:  [BH, Dk, 1]  keys * beta (column-major, for dot product)
         v_ref:           [BH, 1, Dv]  values (row-major)
@@ -768,8 +773,8 @@ def nki_recurrent_gated_delta_rule_decode_v6_bf16(
         out_ref:         [BH, 1, Dv]  output (row-major, fp32)
         final_state_ref: [BH, Dk, Dv] final state (bf16)
     """
-    bh = qk_ref.shape[0]
-    dk = qk_ref.shape[1]   # Dk = 128
+    bh = q_ref.shape[0]
+    dk = q_ref.shape[1]    # Dk = 128
     dv = v_ref.shape[2]    # Dv = 128
 
     out_ref = nl.ndarray((bh, 1, dv), dtype=nl.float32, buffer=nl.shared_hbm)
@@ -782,9 +787,12 @@ def nki_recurrent_gated_delta_rule_decode_v6_bf16(
         state = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(state, state_bf16, nl.multiply, 1.0)
 
-        # Load inputs
-        qk_t = nl.ndarray((dk, 2), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=qk_t, src=qk_ref[idx, :, :])
+        # Load inputs (all separate, no in-kernel slicing)
+        q_col = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=q_col, src=q_ref[idx, :, :])
+
+        k_col = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=k_col, src=k_ref[idx, :, :])
 
         k_beta_row = nl.ndarray((1, dk), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=k_beta_row, src=k_beta_row_ref[idx, :, :])
@@ -801,27 +809,24 @@ def nki_recurrent_gated_delta_rule_decode_v6_bf16(
         # Step 1: state *= exp(g) (column-broadcast)
         nisa.tensor_scalar(state, state, nl.multiply, exp_g_bc)
 
-        # Step 2: FUSED q/k matmul — [q,k]^T @ state → [2, Dv]
-        # One nc_matmul replaces two separate vector-matrix products
-        qk_psum = nl.ndarray((2, dv), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(qk_psum, qk_t, state)
-        qk_out = nl.ndarray((2, dv), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(qk_out, qk_psum)
-
-        # Split: row 0 = q^T @ state_scaled (base_out), row 1 = k^T @ state_scaled (kv_mem)
+        # Step 2: base_out = q^T @ state_scaled → [1, Dv]
+        base_psum = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(base_psum, q_col, state)
         base_out = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(base_out, qk_out[0:1, :])
-        kv_mem = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(kv_mem, qk_out[1:2, :])
+        nisa.tensor_copy(base_out, base_psum)
 
-        # Step 3: delta = v - kv_mem → [1, Dv]
+        # Step 3: kv_mem = k^T @ state_scaled → [1, Dv]
+        kv_psum = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(kv_psum, k_col, state)
+        kv_mem = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(kv_mem, kv_psum)
+
+        # Step 4: delta = v - kv_mem → [1, Dv]
         delta = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(delta, v_t, kv_mem, op=nl.subtract)
 
-        # Step 4: out = base_out + (q·k_beta) * delta
+        # Step 5: out = base_out + (q·k_beta) * delta
         # q·k_beta = k_beta_col^T @ q_col  (nc_matmul: [Dk,1]@[Dk,1] → [1,1])
-        q_col = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(q_col, qk_t[:, 0:1])
         qkb_psum = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(qkb_psum, k_beta_col, q_col)
         q_dot_kb_scalar = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -833,7 +838,7 @@ def nki_recurrent_gated_delta_rule_decode_v6_bf16(
         out_sbuf = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(out_sbuf, base_out, correction, op=nl.add)
 
-        # Step 5: state += outer(k_beta, delta) → [Dk, Dv] (needed for next token)
+        # Step 6: state += outer(k_beta, delta) → [Dk, Dv]
         outer_psum = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(outer_psum, k_beta_row, delta)
         outer = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)

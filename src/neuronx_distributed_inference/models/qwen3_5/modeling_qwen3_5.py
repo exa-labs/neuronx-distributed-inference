@@ -761,19 +761,17 @@ def nki_gated_delta_rule(
         state_flat = state_flat.contiguous()
 
         if _DELTANET_DECODE_KERNEL == "nki_v6_bf16":
-            # v6_bf16: fused q/k matmul + algebraic output decomposition
-            # Batches q^T@state and k^T@state into ONE nc_matmul (33% TE reduction)
+            # v6_bf16: algebraic output decomposition (shorter critical path)
+            # Output doesn't depend on state update → breaks v4's serial dependency
             exp_g_bc = exp_g_flat.unsqueeze(-1).expand(-1, k_head_dim).contiguous()
             k_beta = k_f32 * beta_flat.unsqueeze(-1)  # [BH, Dk]
             k_beta_row = k_beta.unsqueeze(1).contiguous()  # [BH, 1, Dk]
             k_beta_col = k_beta.unsqueeze(-1).contiguous()  # [BH, Dk, 1]
             v_row = v_f32.unsqueeze(1).contiguous()  # [BH, 1, Dv]
             state_bf16 = state_flat.to(torch.bfloat16).contiguous()
-            # Stack q and k as [BH, Dk, 2] for fused matmul
-            qk_stacked = torch.cat([q_col, k_col], dim=-1).contiguous()  # [BH, Dk, 2]
 
             out_flat, final_state_flat = nki_recurrent_gated_delta_rule_decode_v6_bf16(
-                qk_stacked, k_beta_row, k_beta_col, v_row, exp_g_bc, state_bf16
+                q_col, k_col, k_beta_row, k_beta_col, v_row, exp_g_bc, state_bf16
             )
         elif _DELTANET_DECODE_KERNEL == "nki_v5_bf16":
             # v5_bf16: rank-1 decomposition + parallel_range + bf16 state

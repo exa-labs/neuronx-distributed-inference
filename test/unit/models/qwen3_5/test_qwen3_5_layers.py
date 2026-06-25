@@ -510,8 +510,7 @@ class TestGatedDeltaRuleKernels(unittest.TestCase):
         v_row = v.contiguous()  # [BH, 1, Dv]
         state_bf16 = state.to(torch.bfloat16).contiguous()
 
-        # v6_bf16 inputs (stacked q/k + k_beta in both row and col form)
-        qk_stacked = torch.cat([q, k], dim=-1).contiguous()  # [BH, Dk, 2]
+        # v6_bf16 inputs (separate q/k + k_beta in both row and col form)
         k_beta_col = k_beta.unsqueeze(-1).contiguous()  # [BH, Dk, 1]
 
         try:
@@ -520,7 +519,7 @@ class TestGatedDeltaRuleKernels(unittest.TestCase):
                 exp_g_bc.numpy(), state_bf16.clone().numpy(),
             )
             out_v6, state_v6 = nki.simulate(nki_recurrent_gated_delta_rule_decode_v6_bf16)(
-                qk_stacked.numpy(), k_beta_row.numpy(), k_beta_col.numpy(),
+                q.numpy(), k.numpy(), k_beta_row.numpy(), k_beta_col.numpy(),
                 v_row.numpy(), exp_g_bc.numpy(), state_bf16.clone().numpy(),
             )
         except Exception as exc:
