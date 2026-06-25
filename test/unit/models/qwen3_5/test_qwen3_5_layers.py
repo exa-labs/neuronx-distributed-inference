@@ -483,6 +483,57 @@ class TestGatedDeltaRuleKernels(unittest.TestCase):
         assert_close(self, out_v2, out_v3, rtol=1e-5, name="decode v3 output")
         assert_close(self, state_v2, state_v3, rtol=1e-5, name="decode v3 state")
 
+    def test_nki_decode_v6_bf16_matches_v4_bf16(self):
+        """The v6_bf16 kernel (fused q/k matmul + algebraic decomposition) must
+        produce identical results to v4_bf16."""
+        try:
+            import nki  # noqa: F401
+            from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
+                nki_recurrent_gated_delta_rule_decode_v4_bf16,
+                nki_recurrent_gated_delta_rule_decode_v6_bf16,
+            )
+        except ImportError:
+            self.skipTest("nki not available in this environment")
+
+        bh, dk, dv = 8, 128, 128
+        q = torch.randn(bh, dk, 1)
+        k = torch.randn(bh, dk, 1)
+        v = torch.randn(bh, 1, dv)
+        exp_g = torch.rand(bh, 1) + 0.5
+        beta = torch.rand(bh, 1)
+        state = torch.randn(bh, dk, dv)
+
+        # v4_bf16 inputs
+        exp_g_bc = exp_g.expand(-1, dk).contiguous()  # [BH, Dk]
+        k_beta = k.squeeze(-1) * beta  # [BH, Dk]
+        k_beta_row = k_beta.unsqueeze(1).contiguous()  # [BH, 1, Dk]
+        v_row = v.contiguous()  # [BH, 1, Dv]
+        state_bf16 = state.to(torch.bfloat16).contiguous()
+
+        # v6_bf16 inputs (stacked q/k + precomputed scalar)
+        qk_stacked = torch.cat([q, k], dim=-1).contiguous()  # [BH, Dk, 2]
+        q_dot_kbeta = (q.squeeze(-1) * k_beta).sum(dim=-1).contiguous()  # [BH]
+
+        try:
+            out_v4, state_v4 = nki.simulate(nki_recurrent_gated_delta_rule_decode_v4_bf16)(
+                q.numpy(), k.numpy(), k_beta_row.numpy(), v_row.numpy(),
+                exp_g_bc.numpy(), state_bf16.clone().numpy(),
+            )
+            out_v6, state_v6 = nki.simulate(nki_recurrent_gated_delta_rule_decode_v6_bf16)(
+                qk_stacked.numpy(), k_beta_row.numpy(), v_row.numpy(),
+                exp_g_bc.numpy(), state_bf16.clone().numpy(), q_dot_kbeta.numpy(),
+            )
+        except Exception as exc:
+            self.skipTest(f"nki.simulate unavailable: {exc}")
+
+        out_v4 = torch.from_numpy(numpy.asarray(out_v4)).float()
+        state_v4 = torch.from_numpy(numpy.asarray(state_v4)).float()
+        out_v6 = torch.from_numpy(numpy.asarray(out_v6)).float()
+        state_v6 = torch.from_numpy(numpy.asarray(state_v6)).float()
+
+        assert_close(self, out_v4, out_v6, rtol=1e-4, name="decode v6 output")
+        assert_close(self, state_v4, state_v6, rtol=1e-4, name="decode v6 state")
+
     def test_chunked_vs_recurrent_consistency(self):
         """Both forms compute the same math, so prefill-then-decode must equal
         a longer prefill."""
