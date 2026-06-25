@@ -762,7 +762,7 @@ def nki_recurrent_gated_delta_rule_decode_v6_bf16(
         v_ref:           [BH, 1, Dv]  values (row-major)
         exp_g_bc_ref:    [BH, Dk]     exp(g) broadcast to Dk
         state_ref:       [BH, Dk, Dv] initial state (bf16)
-        q_dot_kbeta_ref: [BH]         precomputed q · (k*beta) scalar per head
+        q_dot_kbeta_ref: [BH, 1]      precomputed q · (k*beta) scalar per head
 
     Returns:
         out_ref:         [BH, 1, Dv]  output (row-major, fp32)
@@ -816,9 +816,9 @@ def nki_recurrent_gated_delta_rule_decode_v6_bf16(
         nisa.tensor_tensor(delta, v_t, kv_mem, op=nl.subtract)
 
         # Step 4: out = base_out + (q·k_beta) * delta (scalar correction, no matmul!)
-        # Load precomputed scalar q·k_beta
+        # Load precomputed scalar q·k_beta — ref is [BH, 1]
         q_dot_kb_scalar = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=q_dot_kb_scalar, src=q_dot_kbeta_ref[idx:idx+1])
+        nisa.dma_copy(dst=q_dot_kb_scalar, src=q_dot_kbeta_ref[idx, :])
         # correction = scalar * delta
         correction = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(correction, delta, nl.multiply, q_dot_kb_scalar)

@@ -770,8 +770,8 @@ def nki_gated_delta_rule(
             state_bf16 = state_flat.to(torch.bfloat16).contiguous()
             # Stack q and k as [BH, Dk, 2] for fused matmul
             qk_stacked = torch.cat([q_col, k_col], dim=-1).contiguous()  # [BH, Dk, 2]
-            # Precompute scalar q·(k*beta) per head
-            q_dot_kbeta = (q_f32 * k_beta).sum(dim=-1).contiguous()  # [BH]
+            # Precompute scalar q·(k*beta) per head — [BH, 1] (NKI needs ≥2D refs)
+            q_dot_kbeta = (q_f32 * k_beta).sum(dim=-1, keepdim=True).contiguous()  # [BH, 1]
 
             out_flat, final_state_flat = nki_recurrent_gated_delta_rule_decode_v6_bf16(
                 qk_stacked, k_beta_row, v_row, exp_g_bc, state_bf16, q_dot_kbeta

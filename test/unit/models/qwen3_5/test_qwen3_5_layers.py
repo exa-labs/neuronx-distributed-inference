@@ -512,7 +512,7 @@ class TestGatedDeltaRuleKernels(unittest.TestCase):
 
         # v6_bf16 inputs (stacked q/k + precomputed scalar)
         qk_stacked = torch.cat([q, k], dim=-1).contiguous()  # [BH, Dk, 2]
-        q_dot_kbeta = (q.squeeze(-1) * k_beta).sum(dim=-1).contiguous()  # [BH]
+        q_dot_kbeta = (q.squeeze(-1) * k_beta).sum(dim=-1, keepdim=True).contiguous()  # [BH, 1]
 
         try:
             out_v4, state_v4 = nki.simulate(nki_recurrent_gated_delta_rule_decode_v4_bf16)(
