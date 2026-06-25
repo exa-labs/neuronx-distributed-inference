@@ -1813,6 +1813,11 @@ class NeuronQwen3_5ForCausalLM(NeuronBaseForCausalLM):
         # override via QWEN35_TKG_OPT_LEVEL env for experimentation.
         tkg_opt_level = os.environ.get("QWEN35_TKG_OPT_LEVEL", "-O1")
         tkg_opt = tkg_opt_level if is_tkg else "-O1"
+        # CTE opt level: -O1 by default; override with QWEN35_CTE_OPT_LEVEL.
+        # -O2 for CTE may improve prefill scheduling but needs ~48GiB compile
+        # RAM.  Compute-communication overlap flags are only applied at -O1
+        # (they conflict with -O2's optimizer).
+        cte_opt_level = os.environ.get("QWEN35_CTE_OPT_LEVEL", "-O1")
         # Mixed-precision accumulation: bf16 TensorEngine accumulation for FFN
         # and attention projections.  NKI kernels specify their own (fp32).
         # Disable via QWEN35_DISABLE_MPA=1 for A/B testing.
@@ -1824,13 +1829,18 @@ class NeuronQwen3_5ForCausalLM(NeuronBaseForCausalLM):
                 f"--lnc={self.neuron_config.logical_nc_config} {tkg_opt}"
             )
         # CTE: use ccop overlap with tiling-factor=2 for compute-communication
-        # pipelining during long prefill passes.
-        return (
-            f"--auto-cast=none --model-type=transformer {mpa} "
+        # pipelining during long prefill passes (only at -O1; -O2 uses its own
+        # scheduling that subsumes ccop overlap).
+        ccop = (
             "--tensorizer-options='--enable-ccop-compute-overlap "
             "--cc-pipeline-tiling-factor=2 --vectorize-strided-dma ' "
+            if cte_opt_level == "-O1" else ""
+        )
+        return (
+            f"--auto-cast=none --model-type=transformer {mpa} "
+            f"{ccop}"
             f"{hlo2t} "
-            f"--lnc={self.neuron_config.logical_nc_config} -O1"
+            f"--lnc={self.neuron_config.logical_nc_config} {cte_opt_level}"
         )
 
     @staticmethod
