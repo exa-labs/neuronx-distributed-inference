@@ -739,30 +739,30 @@ def nki_recurrent_gated_delta_rule_decode_v4_bf16(
 
 @nki.jit(mode="torchxla")
 def nki_recurrent_gated_delta_rule_decode_v6_bf16(
-    qk_ref, k_beta_row_ref, v_ref, exp_g_bc_ref, state_ref, q_dot_kbeta_ref
+    qk_ref, k_beta_row_ref, k_beta_col_ref, v_ref, exp_g_bc_ref, state_ref
 ):
     """Decode kernel v6: fused q/k matmul + algebraic output decomposition.
 
     Key optimisation over v4: batches q^T@state and k^T@state into a single
     nc_matmul by stacking [q, k] as [Dk, 2], reducing the critical path from
-    3 nc_matmul to 2 (33% tensor engine reduction per head).
+    3 nc_matmul to 2 large TensorEngine ops (the q·k_beta dot is a tiny 1×128×1
+    that barely registers on the TE pipeline).
 
     Uses algebraic decomposition:
       state_scaled = state * exp_g
-      [base_out; kv_mem] = [q, k]^T @ state_scaled   (ONE nc_matmul)
+      [base_out; kv_mem] = [q, k]^T @ state_scaled   (ONE nc_matmul, [Dk,2]@[Dk,Dv])
       delta = v - kv_mem
-      out = base_out + (q·k_beta) * delta             (scalar ops, no matmul)
-      state_new = state_scaled + outer(k_beta, delta) (ONE nc_matmul)
-
-    The scalar q·k_beta is precomputed on host (negligible cost).
+      q_dot_kb = k_beta_col^T @ q_col                 (tiny [Dk,1]@[Dk,1] → [1,1])
+      out = base_out + q_dot_kb * delta               (scalar broadcast)
+      state_new = state_scaled + outer(k_beta, delta) (ONE nc_matmul, [1,Dk]@[1,Dv])
 
     Args:
         qk_ref:          [BH, Dk, 2]  stacked queries+keys (column-major)
         k_beta_row_ref:  [BH, 1, Dk]  keys * beta (row-major, for outer product)
+        k_beta_col_ref:  [BH, Dk, 1]  keys * beta (column-major, for dot product)
         v_ref:           [BH, 1, Dv]  values (row-major)
         exp_g_bc_ref:    [BH, Dk]     exp(g) broadcast to Dk
         state_ref:       [BH, Dk, Dv] initial state (bf16)
-        q_dot_kbeta_ref: [BH, 1]      precomputed q · (k*beta) scalar per head
 
     Returns:
         out_ref:         [BH, 1, Dv]  output (row-major, fp32)
@@ -788,6 +788,9 @@ def nki_recurrent_gated_delta_rule_decode_v6_bf16(
 
         k_beta_row = nl.ndarray((1, dk), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=k_beta_row, src=k_beta_row_ref[idx, :, :])
+
+        k_beta_col = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=k_beta_col, src=k_beta_col_ref[idx, :, :])
 
         v_t = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=v_t, src=v_ref[idx, :, :])
@@ -815,10 +818,14 @@ def nki_recurrent_gated_delta_rule_decode_v6_bf16(
         delta = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(delta, v_t, kv_mem, op=nl.subtract)
 
-        # Step 4: out = base_out + (q·k_beta) * delta (scalar correction, no matmul!)
-        # Load precomputed scalar q·k_beta — ref is [BH, 1]
+        # Step 4: out = base_out + (q·k_beta) * delta
+        # q·k_beta = k_beta_col^T @ q_col  (nc_matmul: [Dk,1]@[Dk,1] → [1,1])
+        q_col = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(q_col, qk_t[:, 0:1])
+        qkb_psum = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(qkb_psum, k_beta_col, q_col)
         q_dot_kb_scalar = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=q_dot_kb_scalar, src=q_dot_kbeta_ref[idx, :])
+        nisa.tensor_copy(q_dot_kb_scalar, qkb_psum)
         # correction = scalar * delta
         correction = nl.ndarray((1, dv), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(correction, delta, nl.multiply, q_dot_kb_scalar)

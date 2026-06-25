@@ -510,9 +510,9 @@ class TestGatedDeltaRuleKernels(unittest.TestCase):
         v_row = v.contiguous()  # [BH, 1, Dv]
         state_bf16 = state.to(torch.bfloat16).contiguous()
 
-        # v6_bf16 inputs (stacked q/k + precomputed scalar)
+        # v6_bf16 inputs (stacked q/k + k_beta in both row and col form)
         qk_stacked = torch.cat([q, k], dim=-1).contiguous()  # [BH, Dk, 2]
-        q_dot_kbeta = (q.squeeze(-1) * k_beta).sum(dim=-1, keepdim=True).contiguous()  # [BH, 1]
+        k_beta_col = k_beta.unsqueeze(-1).contiguous()  # [BH, Dk, 1]
 
         try:
             out_v4, state_v4 = nki.simulate(nki_recurrent_gated_delta_rule_decode_v4_bf16)(
@@ -520,8 +520,8 @@ class TestGatedDeltaRuleKernels(unittest.TestCase):
                 exp_g_bc.numpy(), state_bf16.clone().numpy(),
             )
             out_v6, state_v6 = nki.simulate(nki_recurrent_gated_delta_rule_decode_v6_bf16)(
-                qk_stacked.numpy(), k_beta_row.numpy(), v_row.numpy(),
-                exp_g_bc.numpy(), state_bf16.clone().numpy(), q_dot_kbeta.numpy(),
+                qk_stacked.numpy(), k_beta_row.numpy(), k_beta_col.numpy(),
+                v_row.numpy(), exp_g_bc.numpy(), state_bf16.clone().numpy(),
             )
         except Exception as exc:
             self.skipTest(f"nki.simulate unavailable: {exc}")
