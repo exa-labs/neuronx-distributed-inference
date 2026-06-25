@@ -1012,6 +1012,100 @@ def nki_chunk_gated_delta_rule_kernel_v2(
 
 
 @nki.jit(mode="torchxla")
+def nki_chunk_gated_delta_rule_kernel_v3(
+    value_ref,
+    k_cumdecay_t_ref,
+    qg_t_ref,
+    attn_intra_t_ref,
+    k_decay_ref,
+    g_last_bc_ref,
+    state_ref,
+):
+    """Chunked gated delta rule v3: parallel_range for DMA/compute overlap across heads.
+
+    Same math as v2, but the outer head loop uses ``nl.parallel_range(bh)`` instead
+    of ``nl.affine_range(bh)``.  This lets the compiler overlap DMA loads for head
+    N+1 with TensorEngine compute for head N, reducing effective latency when
+    processing many independent heads (e.g. 8 heads × batch during prefill).
+
+    The inner chunk loop remains ``nl.sequential_range(nc)`` because chunks have
+    inter-chunk state dependencies.
+
+    Args:
+        value_ref:        [BH, NC, C, Dv]  UT-transformed values
+        k_cumdecay_t_ref: [BH, NC, Dk, C]  k_cumdecay transposed (stationary)
+        qg_t_ref:         [BH, NC, Dk, C]  (query * exp(g)) transposed (stationary)
+        attn_intra_t_ref: [BH, NC, C, C]   intra-chunk attn transposed (stationary)
+        k_decay_ref:      [BH, NC, C, Dk]  decayed keys (natural layout)
+        g_last_bc_ref:    [BH, NC, Dk]     exp(g_last) pre-broadcast to Dk
+        state_ref:        [BH, Dk, Dv]     initial recurrent state (fp32)
+
+    Returns:
+        out_ref:         [BH, NC, C, Dv]  per-chunk core attention output (fp32)
+        final_state_ref: [BH, Dk, Dv]     final recurrent state (fp32)
+    """
+    bh = value_ref.shape[0]
+    nc = value_ref.shape[1]
+    c = value_ref.shape[2]
+    dv = value_ref.shape[3]
+    dk = k_decay_ref.shape[3]
+
+    out_ref = nl.ndarray((bh, nc, c, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+    final_state_ref = nl.ndarray((bh, dk, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    for idx in nl.parallel_range(bh):
+        state = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=state, src=state_ref[idx, :, :])
+
+        for i in nl.sequential_range(nc):
+            kcd_t = nl.ndarray((dk, c), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=kcd_t, src=k_cumdecay_t_ref[idx, i, :, :])
+            qg_t = nl.ndarray((dk, c), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=qg_t, src=qg_t_ref[idx, i, :, :])
+            ait = nl.ndarray((c, c), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=ait, src=attn_intra_t_ref[idx, i, :, :])
+            kd = nl.ndarray((c, dk), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=kd, src=k_decay_ref[idx, i, :, :])
+            v = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=v, src=value_ref[idx, i, :, :])
+
+            vp_psum = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(vp_psum, kcd_t, state)
+            vp = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(vp, vp_psum)
+
+            v_new = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(v_new, v, vp, op=nl.subtract)
+
+            ai_psum = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(ai_psum, qg_t, state)
+            ai = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(ai, ai_psum)
+
+            tmp_psum = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(tmp_psum, ait, v_new)
+            tmp = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(tmp, tmp_psum)
+            core = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(core, ai, tmp, op=nl.add)
+            nisa.dma_copy(dst=out_ref[idx, i, :, :], src=core)
+
+            su_psum = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(su_psum, kd, v_new)
+            su = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(su, su_psum)
+
+            g_bc = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=g_bc, src=g_last_bc_ref[idx, i, :])
+            nisa.tensor_scalar(state, state, nl.multiply, g_bc)
+            nisa.tensor_tensor(state, state, su, op=nl.add)
+
+        nisa.dma_copy(dst=final_state_ref[idx, :, :], src=state)
+
+    return out_ref, final_state_ref
+
+
+@nki.jit(mode="torchxla")
 def nki_recurrent_gated_delta_rule_decode_v5_bf16(
     q_ref, k_ref, k_beta_col_ref, k_beta_row_ref, v_ref, exp_g_bc_ref, state_ref
 ):

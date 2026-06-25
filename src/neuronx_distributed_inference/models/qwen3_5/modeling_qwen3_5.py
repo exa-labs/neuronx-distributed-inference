@@ -47,6 +47,7 @@ try:
     from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
         nki_chunk_gated_delta_rule_kernel,
         nki_chunk_gated_delta_rule_kernel_v2,
+        nki_chunk_gated_delta_rule_kernel_v3,
         nki_recurrent_gated_delta_rule,
         nki_recurrent_gated_delta_rule_decode,
         nki_recurrent_gated_delta_rule_decode_v2,
@@ -98,6 +99,12 @@ _DELTANET_SHARD_PREFILL = os.environ.get("QWEN35_DELTANET_SHARD_PREFILL") == "1"
 # compile it); "nki" runs the hand-written chunked NKI kernel that bypasses the
 # XLA trace entirely.
 _DELTANET_CHUNK_PREFILL = os.environ.get("QWEN35_DELTANET_CHUNK_PREFILL", "")
+
+# NKI chunked kernel version: "v2" (default, affine_range — sequential heads) or
+# "v3" (parallel_range — compiler can overlap DMA across heads for pipelining).
+_DELTANET_CHUNK_KERNEL_VERSION = os.environ.get(
+    "QWEN35_DELTANET_CHUNK_KERNEL_VERSION", "v2"
+)
 
 # Chunk size for the chunked delta rule (both torch and NKI paths).  The NKI
 # kernel's nc_matmul operates on partition_dim × free_dim tiles up to [128, 128].
@@ -631,7 +638,12 @@ def nki_chunk_gated_delta_rule(
     # eliminating 3 NKI instructions/chunk (scalar DMA + nc_matmul + copy).
     g_last_bc = g_last.unsqueeze(-1).expand(-1, -1, k_head_dim).contiguous()
 
-    core_flat, final_state_flat = nki_chunk_gated_delta_rule_kernel_v2(
+    _chunk_kernel = (
+        nki_chunk_gated_delta_rule_kernel_v3
+        if _DELTANET_CHUNK_KERNEL_VERSION == "v3"
+        else nki_chunk_gated_delta_rule_kernel_v2
+    )
+    core_flat, final_state_flat = _chunk_kernel(
         value, k_cumdecay_t, qg_t, attn_intra_t, k_decay, g_last_bc, init_state
     )
 
