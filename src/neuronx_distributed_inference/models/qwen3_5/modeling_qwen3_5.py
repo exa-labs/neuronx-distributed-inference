@@ -181,6 +181,22 @@ _DELTANET_STATE_DTYPE = os.environ.get(
     "bf16" if _DELTANET_DECODE_KERNEL in ("nki_v2_bf16", "nki_v4_bf16", "nki_v5_bf16", "nki_v6_bf16") else "fp32",
 )
 
+# Query-tile width for the full-attention context-encoding softmax.  The naive
+# CTE path materialises the whole ``[seq_len, seq_len]`` score triangle in fp32
+# (``F.softmax(scores.float())``); at head_dim=256 / 8 local heads a single-pass
+# 7500-token prompt needs a ~2GB fp32 workspace per core, which overflows the
+# 16GB inf2.xlarge (tp2) DRAM and is the reason the benchmark is forced into
+# many small ``cte_bucket`` passes (each a full model forward → poor matmul MFU
+# on the dominant dense SwiGLU MLP).  Tiling the *query* axis into blocks of
+# this width bounds the peak score activation to ``O(tile · seq_len)`` fp32
+# while staying numerically equivalent (softmax is row-wise, so grouping rows
+# changes nothing; only the causal upper triangle is skipped -- its masked
+# scores contribute exactly zero).  This unblocks the
+# single high-MFU context-encoding pass that matches the dense Qwen3-4B path.
+# 0 (default) keeps the materialised path so CPU equivalence tests and existing
+# benchmarks are unchanged; >0 enables tiling for context lengths above it.
+_FULLATTN_PREFILL_TILE = int(os.environ.get("QWEN35_FULLATTN_PREFILL_TILE", "0"))
+
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
@@ -1286,6 +1302,47 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _tiled_causal_prefill_attention(
+    query_states, k_full, v_full, attention_mask, head_dim, query_tile
+):
+    """Full causal context-encoding attention computed in query-row blocks.
+
+    Numerically-equivalent replacement for the materialised path
+    ``softmax(mask(q @ kᵀ / √d)) @ v``: softmax is row-wise, so partitioning the
+    query axis into ``query_tile``-row blocks leaves every row's result
+    unchanged (identical in bf16; fp32 differs only at ~1e-7 from matmul
+    reduction order, far under the rtol=1e-4 equivalence gate).  Because
+    attention is causal, block ``i`` (rows
+    ``[i·T, (i+1)·T)``) only needs keys/values ``[0, (i+1)·T)``, so its fp32
+    score activation is ``[B, H, T, ≤seq_len]`` instead of the full
+    ``[B, H, seq_len, seq_len]`` triangle.  Bounding that quadratic workspace is
+    what lets a long prompt run as a single context-encoding pass on inf2.xlarge
+    (tp2) rather than being split into many low-MFU ``cte_bucket`` passes.
+
+    ``k_full``/``v_full`` are the GQA-expanded key/value tensors and
+    ``attention_mask`` the ``[B, 1, seq_len, seq_len]`` causal mask; both are
+    sliced per block, never copied in full.
+    """
+    seq_len = query_states.shape[2]
+    n_tiles = math.ceil(seq_len / query_tile)
+    outputs = []
+    for i in range(n_tiles):
+        start = i * query_tile
+        end = min(start + query_tile, seq_len)
+        q_blk = query_states[:, :, start:end, :]
+        k_vis = k_full[:, :, :end, :]
+        v_vis = v_full[:, :, :end, :]
+        scores = q_blk @ k_vis.transpose(-1, -2) / (head_dim ** 0.5)
+        scores = torch.where(
+            attention_mask[:, :, start:end, :end],
+            scores,
+            torch.finfo(scores.dtype).min,
+        )
+        probs = F.softmax(scores.float(), dim=-1).to(scores.dtype)
+        outputs.append(probs @ v_vis)
+    return torch.cat(outputs, dim=2)
+
+
 def apply_partial_rotary_pos_emb(q, k, cos, sin):
     """Apply RoPE to the first ``rotary_dim`` channels only (partial rotary)."""
     cos = cos.unsqueeze(1)
@@ -1427,12 +1484,22 @@ class NeuronQwen3_5Attention(nn.Module):
         if past_key_value is None:
             # Context encoding: causal attention over the input.
             k_full, v_full = _expand_kv(key_states, value_states)
-            scores = query_states @ k_full.transpose(-1, -2) / (self.head_dim ** 0.5)
-            scores = torch.where(
-                attention_mask, scores, torch.finfo(scores.dtype).min
-            )
-            probs = F.softmax(scores.float(), dim=-1).to(scores.dtype)
-            attn_output = probs @ v_full
+            if _FULLATTN_PREFILL_TILE > 0 and seq_len > _FULLATTN_PREFILL_TILE:
+                attn_output = _tiled_causal_prefill_attention(
+                    query_states,
+                    k_full,
+                    v_full,
+                    attention_mask,
+                    self.head_dim,
+                    _FULLATTN_PREFILL_TILE,
+                )
+            else:
+                scores = query_states @ k_full.transpose(-1, -2) / (self.head_dim ** 0.5)
+                scores = torch.where(
+                    attention_mask, scores, torch.finfo(scores.dtype).min
+                )
+                probs = F.softmax(scores.float(), dim=-1).to(scores.dtype)
+                attn_output = probs @ v_full
         else:
             # Token generation: attend over the cache (masked by attention_mask)
             # plus the current token (masked by active_mask). Mirror

@@ -42,6 +42,7 @@ from neuronx_distributed_inference.models.qwen3_5.modeling_qwen3_5 import (
     NeuronQwen3_5SparseMoeBlock,
     Qwen3_5InferenceConfig,
     Qwen3_5RMSNorm,
+    _tiled_causal_prefill_attention,
     chunk_gated_delta_rule,
     convert_qwen3_5_hf_to_neuron_state_dict,
     recurrent_gated_delta_rule,
@@ -553,6 +554,42 @@ class TestGatedDeltaRuleKernels(unittest.TestCase):
         )
         assert_close(self, full_out[:, :-1], prefill_out, rtol=1e-4, name="prefill part")
         assert_close(self, full_out[:, -1:], decode_out, rtol=1e-4, name="decode step")
+
+
+class TestTiledCausalPrefillAttention(unittest.TestCase):
+    """Query-tiled full-attention CTE softmax vs the materialised path.
+
+    The tiled path is what lets a long prompt run as a single high-MFU
+    context-encoding pass without the O(seq_len**2) fp32 score workspace; it
+    must reproduce the materialised ``softmax(mask(q @ kT / sqrt(d))) @ v``.
+    """
+
+    def _materialised(self, q, k, v, mask, head_dim):
+        scores = q @ k.transpose(-1, -2) / (head_dim ** 0.5)
+        scores = torch.where(mask, scores, torch.finfo(scores.dtype).min)
+        probs = torch.nn.functional.softmax(scores.float(), dim=-1).to(scores.dtype)
+        return probs @ v
+
+    def _run(self, dtype, seq_len, tile, head_dim=256):
+        set_random_seed(0)
+        b, h = 2, 3
+        q = torch.randn(b, h, seq_len, head_dim, dtype=dtype)
+        k = torch.randn(b, h, seq_len, head_dim, dtype=dtype)
+        v = torch.randn(b, h, seq_len, head_dim, dtype=dtype)
+        mask = torch.tril(
+            torch.ones(seq_len, seq_len, dtype=torch.bool)
+        ).view(1, 1, seq_len, seq_len)
+        ref = self._materialised(q, k, v, mask, head_dim)
+        got = _tiled_causal_prefill_attention(q, k, v, mask, head_dim, tile)
+        self.assertEqual(got.shape, ref.shape)
+        assert_close(self, ref, got, rtol=1e-4, name=f"{dtype} seq={seq_len} tile={tile}")
+
+    def test_matches_materialised_uneven_and_even_tiles(self):
+        # Uneven (300 = 4*64 + 44) and evenly-divided (256 = 2*128) tilings,
+        # plus a tile wider than the sequence (single block == materialised).
+        for tile in (64, 128, 512):
+            self._run(torch.float32, seq_len=300, tile=tile)
+            self._run(torch.bfloat16, seq_len=256, tile=tile)
 
 
 class TestGatedDeltaNetModule(unittest.TestCase):
