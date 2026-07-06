@@ -33,6 +33,26 @@ from neuronx_distributed_inference.modules.attention.attention_base import Neuro
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 
 
+# neuronx-cc rejects any single graph input larger than 4 GiB (NCC_EVRF023).
+# The fused per-layer embedding table is vocab_size_per_layer_input x
+# (num_hidden_layers * hidden_size_per_layer_input) -- ~4.7 GiB in bf16 for
+# E2B -- so it is split column-wise into equal chunks that each stay under
+# the limit on every tensor-parallel rank.
+_MAX_WEIGHT_INPUT_BYTES = 4 * 2**30 - 2**20
+
+
+def per_layer_embedding_split_sizes(config: InferenceConfig) -> List[int]:
+    """Column split sizes for the per-layer embedding table such that each
+    chunk's per-rank weight input stays under the compiler's 4 GiB limit."""
+    total_cols = config.num_hidden_layers * config.hidden_size_per_layer_input
+    element_size = torch.tensor([], dtype=config.neuron_config.torch_dtype).element_size()
+    per_rank_rows = -(-config.vocab_size_per_layer_input // config.neuron_config.tp_degree)
+    max_cols = max(1, _MAX_WEIGHT_INPUT_BYTES // (per_rank_rows * element_size))
+    num_chunks = -(-total_cols // max_cols)
+    base, remainder = divmod(total_cols, num_chunks)
+    return [base + (1 if i < remainder else 0) for i in range(num_chunks)]
+
+
 class NeuronGemma4RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6, with_scale: bool = True):
         super().__init__()
@@ -348,13 +368,18 @@ class NeuronGemma4TextModel(NeuronBaseModel):
             sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
         )
         if config.hidden_size_per_layer_input and config.hidden_size_per_layer_input > 0:
-            self.embed_tokens_per_layer = ParallelEmbedding(
-                config.vocab_size_per_layer_input,
-                config.num_hidden_layers * config.hidden_size_per_layer_input,
-                self.padding_idx,
-                dtype=config.neuron_config.torch_dtype,
-                shard_across_embedding=True,
-                sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+            self.embed_tokens_per_layer = nn.ModuleList(
+                [
+                    ParallelEmbedding(
+                        config.vocab_size_per_layer_input,
+                        split_size,
+                        self.padding_idx,
+                        dtype=config.neuron_config.torch_dtype,
+                        shard_across_embedding=True,
+                        sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+                    )
+                    for split_size in per_layer_embedding_split_sizes(config)
+                ]
             )
             self.per_layer_model_projection = ColumnParallelLinear(
                 config.hidden_size,
@@ -394,7 +419,13 @@ class NeuronGemma4TextModel(NeuronBaseModel):
             return None
         per_layer_inputs_mask = torch.logical_and(input_ids >= 0, input_ids < self.vocab_size_per_layer_input)
         per_layer_input_ids = torch.where(per_layer_inputs_mask, input_ids, torch.zeros_like(input_ids))
-        per_layer_embeds = self.embed_tokens_per_layer(per_layer_input_ids) * self.embed_scale_per_layer
+        per_layer_embeds = (
+            torch.cat(
+                [chunk(per_layer_input_ids) for chunk in self.embed_tokens_per_layer],
+                dim=-1,
+            )
+            * self.embed_scale_per_layer
+        )
         per_layer_embeds = per_layer_embeds.reshape(
             *input_ids.shape,
             self.config.num_hidden_layers,
@@ -458,6 +489,16 @@ class NeuronGemma4ForCausalLM(NeuronBaseForCausalLM):
             state_dict = {k.replace("model.language_model.", ""): v for k, v in state_dict.items()}
         elif "model.norm.weight" in state_dict:
             state_dict = {k.removeprefix("model."): v for k, v in state_dict.items()}
+
+        per_layer_embedding_key = "embed_tokens_per_layer.weight"
+        if per_layer_embedding_key in state_dict:
+            fused_weight = state_dict.pop(per_layer_embedding_key)
+            offset = 0
+            for chunk_idx, split_size in enumerate(per_layer_embedding_split_sizes(config)):
+                state_dict[f"embed_tokens_per_layer.{chunk_idx}.weight"] = (
+                    fused_weight[:, offset : offset + split_size].detach().clone()
+                )
+                offset += split_size
 
         neuron_config = config.neuron_config
         if neuron_config.vocab_parallel:
