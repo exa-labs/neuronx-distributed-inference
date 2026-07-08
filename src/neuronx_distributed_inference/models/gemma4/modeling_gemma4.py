@@ -30,7 +30,8 @@ from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlam
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
 from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
-from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
+from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding, apply_rotary_pos_emb
+from neuronx_distributed_inference.modules.kvcache.gemma4_kv_cache_manager import Gemma4KVCacheManager
 
 
 # neuronx-cc rejects any single graph input larger than 4 GiB (NCC_EVRF023).
@@ -252,8 +253,32 @@ class NeuronGemma4Attention(NeuronAttentionBase):
             k_layernorm=get_rmsnorm_cls()(config.head_dim, eps=config.rms_norm_eps),
         )
         self.v_layernorm = get_rmsnorm_cls(with_scale=False)(config.head_dim, eps=config.rms_norm_eps)
+        self.rotary_dim = rotary_dim
+
+    def apply_rotary_embedding(self, Q, K, V, position_ids, cos_cache, sin_cache, use_polar_compatible_rope):
+        """Rotary embedding with partial-rotary support.
+
+        Full-attention layers rotate only the first ``rotary_dim`` dims of each
+        head (``partial_rotary_factor`` < 1); the remainder passes through
+        unrotated. The cos/sin caches are computed per layer because layer
+        types use different rotary dims and thetas.
+        """
+        if self.rotary_dim == self.head_dim:
+            return super().apply_rotary_embedding(Q, K, V, position_ids, cos_cache, sin_cache, use_polar_compatible_rope)
+        if cos_cache is None or sin_cache is None:
+            cos_cache, sin_cache = self.rotary_emb(V, position_ids)
+        q_rot, q_pass = Q[..., : self.rotary_dim], Q[..., self.rotary_dim :]
+        k_rot, k_pass = K[..., : self.rotary_dim], K[..., self.rotary_dim :]
+        q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos_cache, sin_cache)
+        Q = torch.cat((q_rot, q_pass), dim=-1)
+        K = torch.cat((k_rot, k_pass), dim=-1)
+        return Q, K, cos_cache, sin_cache
 
     def prep_qkv_tensors(self, *args, **kwargs):
+        # cos/sin caches must not be shared across Gemma 4 layers: sliding and
+        # full layers use different rotary dims and thetas.
+        kwargs.pop("cos_cache", None)
+        kwargs.pop("sin_cache", None)
         q, k, v, cos_cache, sin_cache, residual = super().prep_qkv_tensors(*args, **kwargs)
         v = self.v_layernorm(v)
         return q, k, v, cos_cache, sin_cache, residual
@@ -340,7 +365,9 @@ class NeuronGemma4DecoderLayer(nn.Module):
             hidden_states = hidden_states + per_layer_contribution
 
         hidden_states = hidden_states * self.layer_scalar
-        return (hidden_states, present_key_value, cos_cache, sin_cache, None)
+        # Never propagate cos/sin caches to the next layer: rotary dims/thetas
+        # differ between sliding and full attention layers.
+        return (hidden_states, present_key_value, None, None, None)
 
 
 class NeuronGemma4TextModel(NeuronBaseModel):
@@ -355,6 +382,37 @@ class NeuronGemma4TextModel(NeuronBaseModel):
         self.head_dim = config.global_head_dim
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         self.vocab_size_per_layer_input = config.vocab_size_per_layer_input
+
+        # Per-layer mixed attention: sliding_attention layers use a
+        # sliding_window-long, local_head_dim-wide KV cache; full_attention
+        # layers keep a max_length-long, global_head_dim-wide cache. Setting
+        # sliding_window + has_mixed_attn makes the base model emit both the
+        # global causal mask and the windowed local mask each step; the decoder
+        # layers pick the right one per layer.
+        self.sliding_window = config.sliding_window
+        self.has_mixed_attn = True
+        self.layer_is_sliding = [layer_type == "sliding_attention" for layer_type in config.layer_types]
+        self.layer_head_dims = [
+            config.local_head_dim if is_sliding else config.global_head_dim
+            for is_sliding in self.layer_is_sliding
+        ]
+
+    def init_inference_optimization(self, config: Gemma4InferenceConfig):
+        """Same as the base implementation, but with a per-layer KV cache manager.
+
+        The generic ``KVCacheManager`` sizes every layer identically, which
+        cannot represent Gemma 4's mix of sliding (window x 256) and full
+        (max_length x 512) layer caches.
+        """
+        super().init_inference_optimization(config)
+        self.kv_mgr = Gemma4KVCacheManager(
+            config,
+            num_kv_head=self.num_key_value_heads,
+            layer_is_sliding=self.layer_is_sliding,
+            layer_head_dims=self.layer_head_dims,
+            sliding_window=config.sliding_window,
+            global_rank=self.rank_util,
+        )
 
     def init_model(self, config: Gemma4InferenceConfig):
         self.padding_idx = config.pad_token_id
