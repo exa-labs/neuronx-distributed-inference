@@ -132,6 +132,14 @@ _DELTANET_CHUNK_SIZE = int(os.environ.get("QWEN35_DELTANET_CHUNK_SIZE", "64"))
 # enable_wlt_optimization=False so token_generation is compiled from its own HLO
 # with no cross-graph layout coupling, decoupling the decode NEFF from the
 # prefill config at the cost of a small decode-only layout-opt regression.
+#
+# Measured result: this flag does NOT fix the chunk_size=128 decode fault.  With
+# WLT disabled (log-confirmed "Can't find a priority model, skip optimizing
+# weight layout for other HLOs") the cs128 + cte512 decode NEFF still faults
+# with the identical status=1006 OOB, so the corruption mechanism is deeper
+# than the cross-graph layout pass (e.g. a runtime interaction through the
+# shared on-device state buffers).  cte512 + chunk_size=64 remains the only
+# validated pairing.
 _DELTANET_DISABLE_TKG_WLT = os.environ.get("QWEN35_DISABLE_TKG_WLT") == "1"
 
 # Fully shard the DeltaNet projections across ranks (in_proj ColumnParallel) in
@@ -163,6 +171,16 @@ _DELTANET_SHARD_DECODE = os.environ.get("QWEN35_DELTANET_SHARD_DECODE") == "1"
 # (``nki_within_chunk_state_update``); unlike every XLA-lowered torch form (all
 # of which crash neuronx-cc with NCC_INLA001) it compiles, collapsing the
 # 64-step loop to one dense matmul per chunk while staying bit-near-exact.
+#
+# Measured: "nki" is decode-safe (compiles clean, no INLA001, no decode OOB) but
+# throughput is FLAT -- 109.43 output tok/s vs the 109.15-109.37 "loop" baseline
+# (inf2.xlarge tp2, batch16, cte512, 60 req).  Collapsing the within-chunk loop
+# to a single matmul does not move the blended-MFU needle, which is direct
+# evidence that the DeltaNet recurrence is NOT the tp2 prefill bottleneck.  The
+# 1.82s/req prefill is dominated by the 15 disjoint 512-token CTE passes (each a
+# full 32-layer dense forward at ~18% per-pass MFU that re-streams the ~4GB/core
+# weights from HBM), so the only real MFU lever here is running fewer, larger
+# passes -- which is exactly what the cte_bucket / chunk_size walls block.
 _DELTANET_STATE_UPDATE = os.environ.get("QWEN35_DELTANET_STATE_UPDATE", "loop")
 
 # UT-transform algorithm for the chunk-parallel prefill path.  The UT
