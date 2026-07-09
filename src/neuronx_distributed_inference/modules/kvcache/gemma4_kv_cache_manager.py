@@ -17,16 +17,29 @@
 # write position modulo the window only on sliding layers, exactly mirroring the
 # proven windowed path in the base manager. Everything else (fetch, slice,
 # scatter, quant, tiling) is inherited unchanged.
+#
+# True KV-sharing (Milestone B). Gemma 4 reuses the K/V of the last non-shared
+# layer of each type for every ``num_kv_shared_layers`` trailing layer (HF's
+# ``store_full_length_kv`` semantics). Those shared layers must not own a KV
+# cache at all: they attend the *source* layer's cache (past tokens) plus the
+# source layer's freshly computed K/V (the modeling threads the latter through
+# ``_shared_kv_states``). This manager therefore allocates physical buffers only
+# for the non-shared "owner" layers and aliases every shared layer's reads to its
+# source buffer, skipping its writes. On E2B (35 layers, 20 shared) that removes
+# the 4 shared full-attention caches (~1 GiB each at b64) and 16 shared sliding
+# caches, freeing ~57% of the KV footprint and lifting the batch ceiling.
 
 from typing import List
 
 import torch
+from torch import nn
 
 from neuronx_distributed_inference.models.config import InferenceConfig
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import (
     KV_CACHE_PAD_FOR_SEQ_IDS_MASKING,
     KVCacheManager,
     get_kv_shapes,
+    tile_cache,
 )
 
 
@@ -57,6 +70,7 @@ class Gemma4KVCacheManager(KVCacheManager):
         self.layer_is_sliding = list(layer_is_sliding)
         self.layer_head_dims = list(layer_head_dims)
         self._gemma4_sliding_window = sliding_window
+        self._build_kv_sharing_map(config)
         super().__init__(
             config,
             num_kv_head=num_kv_head,
@@ -65,6 +79,38 @@ class Gemma4KVCacheManager(KVCacheManager):
             layer_to_cache_size_mapping=self._build_cache_size_mapping(config),
             **kwargs,
         )
+        # Milestone B: drop the physical buffers for the trailing shared layers.
+        # ``super().__init__`` allocated one (k, v) pair per layer; the owner
+        # layers are exactly the first ``_first_shared_layer_idx`` layers (HF
+        # marks the *trailing* ``num_kv_shared_layers`` as shared), so their
+        # parameters are the leading ``2 * _first_shared_layer_idx`` entries.
+        if self._kv_sharing_enabled and hasattr(self, "past_key_values"):
+            keep = 2 * self._first_shared_layer_idx
+            self.past_key_values = nn.ParameterList(list(self.past_key_values)[:keep])
+
+    def _build_kv_sharing_map(self, config: InferenceConfig) -> None:
+        """Map each layer to the owner layer whose KV cache it physically uses.
+
+        Non-shared ("owner") layers map to themselves. Each trailing shared layer
+        maps to the last non-shared layer of the *same* ``layer_type`` -- exactly
+        the layer the modeling marks ``store_full_length_kv`` and publishes its
+        post-rope K/V from, so the aliased past cache and the threaded current K/V
+        come from one and the same source layer (HF-faithful).
+        """
+        num_layers = config.num_hidden_layers
+        num_shared = getattr(config, "num_kv_shared_layers", 0) or 0
+        self._kv_sharing_enabled = num_shared > 0
+        self._first_shared_layer_idx = num_layers - num_shared
+        layer_types = list(config.layer_types)
+        prev_layers = layer_types[: self._first_shared_layer_idx]
+        self._layer_owner = []
+        for layer_idx in range(num_layers):
+            if not self._kv_sharing_enabled or layer_idx < self._first_shared_layer_idx:
+                self._layer_owner.append(layer_idx)
+                continue
+            layer_type = layer_types[layer_idx]
+            source_idx = len(prev_layers) - 1 - prev_layers[::-1].index(layer_type)
+            self._layer_owner.append(source_idx)
 
     def _build_cache_size_mapping(self, config: InferenceConfig) -> List[int]:
         """Cache length per layer: window for sliding layers, max_length for full."""
@@ -119,3 +165,79 @@ class Gemma4KVCacheManager(KVCacheManager):
         index = scatter_index if self.is_medusa else position_ids
         view_shape = (-1, 1, index.shape[-1], 1) if not transposed else (-1, 1, 1, index.shape[-1])
         return index.view(*view_shape).expand_as(full_k)
+
+    def _fetch_cache(self, idx: int, kvcache_buffer=None):
+        """Fetch the buffer a layer reads/writes, aliasing shared layers to source.
+
+        Owner layers map to themselves; shared layers map to their source layer's
+        physical buffer, so a shared layer attends the source's accumulated cache.
+        """
+        return super()._fetch_cache(self._layer_owner[idx], kvcache_buffer)
+
+    def get_cache(
+        self, seq_len: int, skip_slice=False, kvcache_buffer=None, seq_ids=None, windowed_context_encoding_window_idx=-1, **kwargs
+    ):
+        """Return per-layer (K, V) for *all* layers, not just the owned buffers.
+
+        The base implementation iterates ``len(self.past_key_values) // 2`` layers,
+        which after Milestone B is only the owner count. The decoder loop indexes
+        the result by absolute layer id, so we iterate all ``num_hidden_layers``
+        and let ``_fetch_cache`` alias shared layers to their source buffer.
+        """
+        past_key_values = []
+        for idx in range(self.config.num_hidden_layers):
+            k_cache, v_cache = self.get_kv_by_layer_id(
+                idx=idx,
+                skip_slice=skip_slice,
+                seq_len=seq_len,
+                kvcache_buffer=kvcache_buffer,
+                seq_ids=seq_ids,
+                windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
+                **kwargs,
+            )
+            past_key_values.append([k_cache, v_cache])
+        return past_key_values
+
+    def update_cache(
+        self,
+        is_for_context_encoding: bool,
+        seq_ids,
+        position_ids,
+        new_key_values,
+        seq_len: int,
+        scatter_index=None,
+        kv_active_mask=None,
+        kvcache_buffer=None,
+        windowed_context_encoding_window_idx: int = -1,
+        **kwargs,
+    ):
+        """Write only the owner layers' caches; shared layers reuse their source.
+
+        ``new_key_values`` still has one entry per layer (the decoder loop appends
+        for every layer). Shared layers carry the source layer's reused K/V, which
+        the source layer already writes, so we skip them -- and the returned list
+        then matches the compacted ``past_key_values`` state (owner buffers only).
+        """
+        updated_kv_cache = []
+        for idx, kv_per_layer in enumerate(new_key_values):
+            if self._kv_sharing_enabled and idx >= self._first_shared_layer_idx:
+                continue
+            k_cache, v_cache = self.update_kv_by_layer_id(
+                idx=idx,
+                is_for_context_encoding=is_for_context_encoding,
+                seq_ids=seq_ids,
+                position_ids=position_ids,
+                kv_per_layer=kv_per_layer,
+                seq_len=seq_len,
+                scatter_index=scatter_index,
+                kv_active_mask=kv_active_mask,
+                kvcache_buffer=kvcache_buffer,
+                windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
+                **kwargs,
+            )
+            if self.is_kv_cache_tiled:
+                k_cache = tile_cache(k_cache, self.k_cache_transposed)
+                v_cache = tile_cache(v_cache, False)
+            updated_kv_cache.append(k_cache)
+            updated_kv_cache.append(v_cache)
+        return updated_kv_cache
