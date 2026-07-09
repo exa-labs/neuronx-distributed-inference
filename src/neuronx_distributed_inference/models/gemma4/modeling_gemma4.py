@@ -88,6 +88,35 @@ def get_rmsnorm_cls(with_scale: bool = True):
     return lambda hidden_size, eps: NeuronGemma4RMSNorm(hidden_size, eps=eps, with_scale=with_scale)
 
 
+class Gemma4ProportionalRotaryEmbedding(RotaryEmbedding):
+    """Proportional RoPE, matching HF gemma4 ``_compute_proportional_rope_parameters``.
+
+    Unlike a plain partial-rotary slice, gemma4's "proportional" rope always
+    produces an encoding spanning the *entire* head_dim: the first
+    ``int(partial_rotary_factor * head_dim // 2)`` frequency pairs are the usual
+    ``1 / base ** (2i / head_dim)`` (note the denominator is the full head_dim,
+    not the rotated width), and the remaining pairs have zero frequency (cos=1,
+    sin=0). Because cos/sin cover all ``head_dim`` dims, the standard NEOX
+    ``rotate_half`` pairs dim ``i`` with dim ``i + head_dim/2`` exactly as HF.
+    """
+
+    def __init__(self, head_dim, partial_rotary_factor, max_position_embeddings, base):
+        super().__init__(dim=head_dim, max_position_embeddings=max_position_embeddings, base=base)
+        self.rope_angles = int(partial_rotary_factor * head_dim // 2)
+
+    def get_inv_freqs(self, device: Optional[torch.device] = None) -> torch.Tensor:
+        head_dim = self.dim
+        idx = torch.arange(0, 2 * self.rope_angles, 2, dtype=torch.float, device=device)
+        inv_freq_rotated = 1.0 / (self.base ** (idx / head_dim))
+        nope_angles = head_dim // 2 - self.rope_angles
+        if nope_angles > 0:
+            return torch.cat(
+                (inv_freq_rotated, torch.zeros(nope_angles, dtype=torch.float32, device=device)),
+                dim=0,
+            )
+        return inv_freq_rotated
+
+
 def get_updated_configs(config: "Gemma4InferenceConfig"):
     updated_configs = []
     for layer_idx, layer_type in enumerate(config.layer_types):
@@ -104,6 +133,14 @@ def get_updated_configs(config: "Gemma4InferenceConfig"):
         )
         first_kv_shared_layer_idx = config.num_hidden_layers - config.num_kv_shared_layers
         updated_config.is_kv_shared_layer = config.num_kv_shared_layers > 0 and layer_idx >= first_kv_shared_layer_idx
+        # The last non-shared layer of each type is the KV source for all shared
+        # layers of that type (mirrors HF Gemma4TextAttention.store_full_length_kv).
+        prev_layers = config.layer_types[:first_kv_shared_layer_idx]
+        updated_config.store_full_length_kv = (
+            not updated_config.is_kv_shared_layer
+            and config.num_kv_shared_layers > 0
+            and layer_idx == len(prev_layers) - 1 - prev_layers[::-1].index(layer_type)
+        )
         updated_config.intermediate_size = config.intermediate_size * (
             2 if config.use_double_wide_mlp and updated_config.is_kv_shared_layer else 1
         )
@@ -227,15 +264,28 @@ class NeuronGemma4Attention(NeuronAttentionBase):
     def __init__(self, config: Gemma4InferenceConfig):
         rope_parameters = config.rope_parameters[config.layer_type] if config.rope_parameters else None
         rope_theta = rope_parameters["rope_theta"] if rope_parameters and "rope_theta" in rope_parameters else 10000.0
-        rotary_dim = config.head_dim
-        if rope_parameters and "partial_rotary_factor" in rope_parameters:
-            rotary_dim = int(config.head_dim * rope_parameters["partial_rotary_factor"])
+        rope_type = rope_parameters.get("rope_type", "default") if rope_parameters else "default"
 
-        rotary_emb = RotaryEmbedding(
-            dim=rotary_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=rope_theta,
-        )
+        if rope_type == "proportional":
+            # gemma4 full-attention layers: proportional rope spans the full
+            # head_dim (partial rotation encoded as trailing zero frequencies),
+            # so the standard full-width rotate_half path applies.
+            rotary_dim = config.head_dim
+            rotary_emb = Gemma4ProportionalRotaryEmbedding(
+                head_dim=config.head_dim,
+                partial_rotary_factor=rope_parameters.get("partial_rotary_factor", 1.0),
+                max_position_embeddings=config.max_position_embeddings,
+                base=rope_theta,
+            )
+        else:
+            rotary_dim = config.head_dim
+            if rope_parameters and "partial_rotary_factor" in rope_parameters:
+                rotary_dim = int(config.head_dim * rope_parameters["partial_rotary_factor"])
+            rotary_emb = RotaryEmbedding(
+                dim=rotary_dim,
+                max_position_embeddings=config.max_position_embeddings,
+                base=rope_theta,
+            )
 
         super().__init__(
             config=config,
@@ -254,6 +304,13 @@ class NeuronGemma4Attention(NeuronAttentionBase):
         )
         self.v_layernorm = get_rmsnorm_cls(with_scale=False)(config.head_dim, eps=config.rms_norm_eps)
         self.rotary_dim = rotary_dim
+        # KV-sharing metadata (Gemma 4 reuses the last non-shared same-type
+        # layer's K/V for every shared layer). Set per forward by the decoder
+        # layer via ``_shared_kv_states``; ``None`` disables sharing entirely.
+        self.layer_type = getattr(config, "layer_type", None)
+        self.is_kv_shared_layer = getattr(config, "is_kv_shared_layer", False)
+        self.store_full_length_kv = getattr(config, "store_full_length_kv", False)
+        self._shared_kv_states = None
 
     def apply_rotary_embedding(self, Q, K, V, position_ids, cos_cache, sin_cache, use_polar_compatible_rope):
         """Rotary embedding with partial-rotary support.
@@ -281,6 +338,16 @@ class NeuronGemma4Attention(NeuronAttentionBase):
         kwargs.pop("sin_cache", None)
         q, k, v, cos_cache, sin_cache, residual = super().prep_qkv_tensors(*args, **kwargs)
         v = self.v_layernorm(v)
+        # True KV-sharing: a shared layer attends its own Q against the source
+        # layer's post-rope K / post-norm V (never recomputing K/V from its own
+        # hidden states), exactly as HF gemma4 does. The source layer stashes its
+        # K/V here so every same-type shared layer downstream reuses them.
+        shared = self._shared_kv_states
+        if shared is not None:
+            if self.is_kv_shared_layer:
+                k, v = shared[self.layer_type]
+            elif self.store_full_length_kv:
+                shared[self.layer_type] = (k, v)
         return q, k, v, cos_cache, sin_cache, residual
 
 
@@ -336,6 +403,9 @@ class NeuronGemma4DecoderLayer(nn.Module):
         per_layer_inputs = kwargs.pop("per_layer_inputs", None)
         if per_layer_input is None and per_layer_inputs is not None:
             per_layer_input = per_layer_inputs[:, :, self.layer_idx, :]
+        # Hand the shared per-forward KV dict to this layer's attention so it can
+        # publish (source layer) or consume (shared layer) the reused K/V.
+        self.self_attn._shared_kv_states = kwargs.pop("shared_kv_states", None)
         mask = local_mask if self.is_sliding_window_attention and local_mask is not None else attention_mask
 
         residual = hidden_states
@@ -505,6 +575,11 @@ class NeuronGemma4TextModel(NeuronBaseModel):
         per_layer_inputs = None if input_ids is None else self.get_per_layer_inputs(input_ids, inputs_embeds)
         kwargs["inputs_embeds"] = inputs_embeds
         kwargs["per_layer_inputs"] = per_layer_inputs
+        # Per-forward scratch dict for KV-sharing: source layers publish their
+        # post-rope K/V here, shared layers read it. Flows to every decoder layer
+        # through the base loop's **kwargs. Empty/no-op when num_kv_shared_layers=0.
+        if self.config.num_kv_shared_layers > 0:
+            kwargs["shared_kv_states"] = {}
         hidden_states = super().get_model_output(input_ids=input_ids, **kwargs)
         return hidden_states
 
