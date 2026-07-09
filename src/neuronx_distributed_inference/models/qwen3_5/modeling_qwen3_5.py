@@ -115,6 +115,25 @@ _DELTANET_CHUNK_KERNEL_VERSION = os.environ.get(
 # many chunks per CTE pass).  Values: 64 (safe/default), 128 (optimal for NKI).
 _DELTANET_CHUNK_SIZE = int(os.environ.get("QWEN35_DELTANET_CHUNK_SIZE", "64"))
 
+# Disable weight-layout optimization (WLO) for the token_generation model.
+#
+# NxD compiles token_generation as the "priority" model (priority_model_idx=0),
+# which runs a weight-layout-optimization pass and then rewrites the *other*
+# HLOs (the context-encoding / prefill model) to consume weights in that layout
+# (ModelBuilder._add_layout_optimization_to_remaining_hlo).  Empirically the
+# resulting token_generation NEFF is NOT invariant to the CTE-graph shape: its
+# module hash changes whenever the prefill graph changes (larger cte_bucket, or
+# deltanet chunk_size=128), and those variants fault the decode NEFF at runtime
+# with `status=1006 Execution Out-Of-Bounds Memory Access` even though the decode
+# code path itself is independent of both cte_bucket and chunk_size.  cte512 +
+# chunk_size=64 is the only pairing whose WLO'd decode NEFF is well-formed, which
+# is exactly why every attempt to raise prefill MFU (bigger buckets / wider
+# chunks) has been blocked.  Setting this to "1" passes
+# enable_wlt_optimization=False so token_generation is compiled from its own HLO
+# with no cross-graph layout coupling, decoupling the decode NEFF from the
+# prefill config at the cost of a small decode-only layout-opt regression.
+_DELTANET_DISABLE_TKG_WLT = os.environ.get("QWEN35_DISABLE_TKG_WLT") == "1"
+
 # Fully shard the DeltaNet projections across ranks (in_proj ColumnParallel) in
 # BOTH prefill and decode, but drive the output through an all-gather of the
 # core attention output followed by a *replicated* out_proj -- instead of the
@@ -197,28 +216,28 @@ _DELTANET_STATE_DTYPE = os.environ.get(
 # benchmarks are unchanged; >0 enables tiling for context lengths above it.
 _FULLATTN_PREFILL_TILE = int(os.environ.get("QWEN35_FULLATTN_PREFILL_TILE", "0"))
 
-from neuronx_distributed.parallel_layers import parallel_state
-from neuronx_distributed.parallel_layers.layers import (
+from neuronx_distributed.parallel_layers import parallel_state  # noqa: E402
+from neuronx_distributed.parallel_layers.layers import (  # noqa: E402
     ColumnParallelLinear,
     ParallelEmbedding,
     RowParallelLinear,
     SPMDRank,
 )
-from neuronx_distributed.parallel_layers.mappings import _gather_along_dim
+from neuronx_distributed.parallel_layers.mappings import _gather_along_dim  # noqa: E402
 
-from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
-from neuronx_distributed_inference.models.model_base import (
+from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig  # noqa: E402
+from neuronx_distributed_inference.models.model_base import (  # noqa: E402
     NeuronBaseForCausalLM,
     NeuronBaseModel,
 )
-from neuronx_distributed_inference.models.model_wrapper import (
+from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402
     CONTEXT_ENCODING_MODEL_TAG,
     TOKEN_GENERATION_MODEL_TAG,
     DecoderModelInstance,
     ModelWrapper,
 )
-from neuronx_distributed_inference.modules.attention.utils import manual_softmax
-from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
+from neuronx_distributed_inference.modules.attention.utils import manual_softmax  # noqa: E402
+from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module  # noqa: E402
 
 
 def _get_tp_degree():
@@ -432,7 +451,6 @@ def chunk_gated_delta_rule(
     value = F.pad(value, (0, 0, 0, pad_size))
     beta = F.pad(beta, (0, pad_size))
     g = F.pad(g, (0, pad_size))
-    padded_length = sequence_length + pad_size
 
     total_sequence_length = query.shape[-2]
     scale = 1 / (query.shape[-1] ** 0.5)
@@ -1855,7 +1873,12 @@ class NeuronQwen3_5ForCausalLM(NeuronBaseForCausalLM):
         # skipped, so the attention layers would be traced with tiling=2 baked
         # into the XLA graph — causing PGTiling (NCC_IPCC901) at batch=14.
         self.neuron_config.cc_pipeline_tiling_factor = 1
-        super().enable_token_generation(**model_init_kwargs)
+        if _DELTANET_DISABLE_TKG_WLT:
+            super().enable_token_generation(
+                enable_wlt_optimization=False, **model_init_kwargs
+            )
+        else:
+            super().enable_token_generation(**model_init_kwargs)
 
     def get_compiler_args(self):
         is_tkg = getattr(self, "compile_tag", None) == TOKEN_GENERATION_MODEL_TAG
