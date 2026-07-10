@@ -30,7 +30,10 @@ from neuronx_distributed_inference.models.gemma3.modeling_gemma3 import get_rmsn
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaMLP
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
 from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
-from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+from neuronx_distributed_inference.modules.attention.attention_base import (
+    NeuronAttentionBase,
+    tkg_attn_nki_enabled,
+)
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding, apply_rotary_pos_emb, manual_softmax
 from neuronx_distributed_inference.modules.kvcache.gemma4_kv_cache_manager import Gemma4KVCacheManager
 
@@ -415,6 +418,12 @@ class NeuronGemma4Attention(NeuronAttentionBase):
             return super().compute_for_token_gen(
                 Q, K, V, position_ids, past_key_value, attention_mask, active_mask, is_prefix_caching
             )
+
+        # Opt-in: fused from-scratch NKI decode attention core (QK^T/mask/softmax/PV
+        # only). Numerically equivalent to the fold path below; frees the per-step
+        # score/softmax/context traffic from the native op sequence.
+        if tkg_attn_nki_enabled() and Q.shape[2] == 1:
+            return self._compute_for_token_gen_nki(Q, K, V, past_key_value, attention_mask)
 
         bsz, _, q_len, head_dim = Q.shape
         Q_folded = self._fold_heads(Q, bsz, q_len)
