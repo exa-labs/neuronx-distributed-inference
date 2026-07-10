@@ -481,15 +481,25 @@ class KVCacheManager(nn.Module):
                 latest_v = torch.index_select(latest_v, dim=1, index=head_idx)
 
             if self.is_continuous_batching:
-                assert seq_ids.dim() == 1 and seq_ids.shape[0] == 1, "only supports single seq_id"
+                assert seq_ids.dim() == 1, "seq_ids must be 1-D"
                 if not (self.neuron_config.k_cache_transposed or self.neuron_config.attention_dp_degree > 1):
+                    # update_cache_const_indices is a per-slot scatter
+                    # (torch.index_put over batch_indices=seq_ids), so it writes
+                    # each request in the batch to its own KV slot.  This makes
+                    # batched context encoding (ctx_batch_size > 1) valid: N
+                    # prefill requests can be stacked into one CTE forward and
+                    # written to N cache slots in one pass.  The other two update
+                    # paths below squeeze the cache index to a scalar, so they
+                    # still require a single seq_id.
                     k_cache = update_cache_const_indices(k_cache, latest_k, seq_ids)
                     v_cache = update_cache_const_indices(v_cache, latest_v, seq_ids)
                 elif self.neuron_config.kv_cache_update_with_kernel:
+                    assert seq_ids.shape[0] == 1, "kernel KV cache update only supports single seq_id"
                     cache_idx = self.get_cache_update_index_for_seq_ids(seq_ids)
                     # For trn2+ we use the dma_skipping KV update kernel for better performance
                     k_cache, v_cache = write_kv_cache_at_batch_kernel[self.neuron_config.logical_nc_config](latest_k, latest_v, k_cache.data, v_cache.data, cache_idx)
                 else:
+                    assert seq_ids.shape[0] == 1, "dynamic_update_slice KV cache update only supports single seq_id"
                     cache_idx = self.get_cache_update_index_for_seq_ids(seq_ids)
                     indices = [cache_idx] + [torch.zeros(1, device=seq_ids.device) for _ in range(k_cache.dim() - 1)]
                     indices = [t.squeeze().to(torch.int32) for t in indices]
