@@ -55,6 +55,42 @@ def _load_f32(ref):
     return dst
 
 
+def _attend_block(qT_tiles, Kb, Vb, Mb, b, s0, s1, nD, D, inv_scale, m, l, acc, has_mask):
+    """Fold one key/value block into the running online-softmax state in place.
+
+    ``Kb``/``Vb`` are ``[B, S, D]`` HBM refs and ``[s0:s1]`` selects this block's
+    rows; ``Mb`` is the ``[B, H, S]`` numeric mask (only when ``has_mask``). The
+    state tensors ``m`` (running max), ``l`` (running denom) and ``acc`` (running
+    weighted value sum) are SBUF buffers mutated through ``[...]`` so the caller
+    sees the update. Kept as an explicit helper (not a packed-tuple loop) because
+    the NKI backend cannot trace a list comprehension of tensor-bearing tuples.
+    """
+    sB = s1 - s0
+    s = nl.zeros((qT_tiles[0].shape[1], sB), dtype=nl.float32, buffer=nl.sbuf)  # [H, sB]
+    for i in nl.static_range(nD):
+        d0, d1 = i * P, min(D, (i + 1) * P)
+        # Kb[b] is [sB, d]; transpose to [d, sB] so the contract dim (d) is on
+        # partitions for both operands.
+        kT = _transpose_sbuf(nl.load(Kb[b, s0:s1, d0:d1]))        # [d, sB]
+        s[...] = nl.add(s, nl.matmul(qT_tiles[i], kT, transpose_x=True))  # [H, sB]
+    s[...] = nl.multiply(s, inv_scale)
+    if has_mask:
+        mb = nl.load(Mb[b, :, s0:s1])                            # [H, sB]
+        s[...] = nl.add(s, nl.multiply(nl.subtract(mb, 1.0), NEG))
+    m_new = nl.maximum(m, nl.max(s, axis=1, keepdims=True))       # [H,1]
+    alpha = nl.exp(nl.subtract(m, m_new))                        # [H,1]
+    p = nl.exp(nl.subtract(s, m_new))                            # [H,sB]
+    l[...] = nl.add(nl.multiply(l, alpha), nl.sum(p, axis=1, keepdims=True))
+    # P.V: contract over sB. Stationary = p.T [sB, H] in SBUF, moving = Vb
+    # [sB, d] loaded directly (partition = sB).
+    pT = _transpose_sbuf(p)                                      # [sB, H]
+    for i in nl.static_range(nD):
+        d0, d1 = i * P, min(D, (i + 1) * P)
+        pv = nl.matmul(pT, _load_f32(Vb[b, s0:s1, d0:d1]), transpose_x=True)  # [H, d]
+        acc[:, d0:d1] = nl.add(nl.multiply(acc[:, d0:d1], alpha), pv)
+    m[...] = m_new
+
+
 @nki.jit
 def tkg_attention_kernel_batched(Q, Kp, Vp, Ka, Va, mask, inv_scale):
     """Fused single-step flash-decode attention over all batch elements."""
@@ -79,34 +115,15 @@ def tkg_attention_kernel_batched(Q, Kp, Vp, Ka, Va, mask, inv_scale):
         l = nl.zeros((H, 1), dtype=nl.float32, buffer=nl.sbuf)
         acc = nl.zeros((H, D), dtype=nl.float32, buffer=nl.sbuf)
 
-        blocks = [(Kp, Vp, mask, j * P, min(Sp, (j + 1) * P)) for j in range(nS)]
-        blocks.append((Ka, Va, None, 0, 1))
-
-        for Kb, Vb, Mb, s0, s1 in blocks:
-            sB = s1 - s0
-            s = nl.zeros((H, sB), dtype=nl.float32, buffer=nl.sbuf)
-            for i in nl.static_range(nD):
-                d0, d1 = i * P, min(D, (i + 1) * P)
-                # Kb[b] is [sB, d]; transpose to [d, sB] so the contract dim (d)
-                # is on partitions for both operands.
-                kT = _transpose_sbuf(nl.load(Kb[b, s0:s1, d0:d1]))  # [d, sB]
-                s[...] = nl.add(s, nl.matmul(qT_tiles[i], kT, transpose_x=True))  # [H, sB]
-            s[...] = nl.multiply(s, inv_scale)
-            if Mb is not None:
-                mb = nl.load(Mb[b, :, s0:s1])                      # [H, sB]
-                s[...] = nl.add(s, nl.multiply(nl.subtract(mb, 1.0), NEG))
-            m_new = nl.maximum(m, nl.max(s, axis=1, keepdims=True))  # [H,1]
-            alpha = nl.exp(nl.subtract(m, m_new))                   # [H,1]
-            p = nl.exp(nl.subtract(s, m_new))                       # [H,sB]
-            l[...] = nl.add(nl.multiply(l, alpha), nl.sum(p, axis=1, keepdims=True))
-            # P.V: contract over sB. Stationary = p.T [sB, H] in SBUF, moving =
-            # Vb [sB, d] loaded directly (partition = sB).
-            pT = _transpose_sbuf(p)                               # [sB, H]
-            for i in nl.static_range(nD):
-                d0, d1 = i * P, min(D, (i + 1) * P)
-                pv = nl.matmul(pT, _load_f32(Vb[b, s0:s1, d0:d1]), transpose_x=True)  # [H, d]
-                acc[:, d0:d1] = nl.add(nl.multiply(acc[:, d0:d1], alpha), pv)
-            m[...] = m_new
+        # Prior (cached) key/value blocks, tiled to the Tensor-Engine free-dim
+        # limit, then the single active-token block. Explicit loop + call rather
+        # than a packed-tuple list so the NKI backend can trace every operand.
+        for j in nl.static_range(nS):
+            s0, s1 = j * P, min(Sp, (j + 1) * P)
+            _attend_block(qT_tiles, Kp, Vp, mask, b, s0, s1, nD, D, inv_scale,
+                          m, l, acc, has_mask=True)
+        _attend_block(qT_tiles, Ka, Va, mask, b, 0, 1, nD, D, inv_scale,
+                      m, l, acc, has_mask=False)
 
         inv_l = nl.reciprocal(l)
         for i in nl.static_range(nD):
