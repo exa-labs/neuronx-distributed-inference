@@ -1504,7 +1504,7 @@ class NeuronAttentionBase(nn.Module):
             )
 
         mask = attention_mask.expand(-1, num_heads, -1, -1)[:, :, 0, :].to(Q.dtype)  # [B, H, Sp]
-        out = tkg_attention_kernel_batched[bsz](
+        out = tkg_attention_kernel_batched(
             Q[:, :, 0, :],                # [B, H, D]
             K_prior[:, 0, :, :],          # [B, Sp, D]
             V_prior[:, 0, :, :],
