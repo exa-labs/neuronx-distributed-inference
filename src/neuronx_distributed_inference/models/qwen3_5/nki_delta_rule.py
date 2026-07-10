@@ -1129,6 +1129,119 @@ def nki_chunk_gated_delta_rule_kernel_v2(
 
 
 @nki.jit(mode="torchxla")
+def nki_chunk_gated_delta_rule_kernel_v2_bf16(
+    value_ref,
+    k_cumdecay_t_ref,
+    qg_t_ref,
+    attn_intra_t_ref,
+    k_decay_ref,
+    g_last_bc_ref,
+    state_ref,
+):
+    """Mixed-precision chunked gated delta rule: bf16 matmul operands, fp32 accum.
+
+    Identical math and control flow to ``..._v2``, but the four ``nc_matmul``
+    contractions (v_prime, attn_inter, intra-chunk, state-update) run with
+    **bf16 multiplicands and fp32 PSUM accumulation** instead of fp32 operands.
+    NeuronCore's TensorEngine is bf16-native: an fp32 ``nc_matmul`` is emulated
+    as ~3-4 bf16 passes, so this kernel targets the DeltaNet prefill's dominant
+    MFU sink (the profile shows ~555k tiny fp32 matmuls per 512-token CTE pass).
+
+    Numerical safety: the recurrent state and every reduction/accumulation stay
+    in fp32 (PSUM is fp32, ``state``/``v_new``/``core`` tiles are fp32).  Only the
+    values *fed into* the PE array are rounded to bf16 — the same precision GPU
+    kernels (and the L40S baseline we compare against) use for these matmuls.
+
+    Args match ``..._v2`` except the four stationary/moving matmul operands are
+    expected as bf16 HBM refs (cast host-side):
+        value_ref:        [BH, NC, C, Dv]  fp32 (only used in fp32 subtraction)
+        k_cumdecay_t_ref: [BH, NC, Dk, C]  bf16
+        qg_t_ref:         [BH, NC, Dk, C]  bf16
+        attn_intra_t_ref: [BH, NC, C, C]   bf16
+        k_decay_ref:      [BH, NC, C, Dk]  bf16
+        g_last_bc_ref:    [BH, NC, Dk]     fp32
+        state_ref:        [BH, Dk, Dv]     fp32 initial recurrent state
+
+    Returns:
+        out_ref:         [BH, NC, C, Dv]  fp32 per-chunk core attention output
+        final_state_ref: [BH, Dk, Dv]     fp32 final recurrent state
+    """
+    bh = value_ref.shape[0]
+    nc = value_ref.shape[1]
+    c = value_ref.shape[2]
+    dv = value_ref.shape[3]
+    dk = k_decay_ref.shape[3]
+
+    out_ref = nl.ndarray((bh, nc, c, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+    final_state_ref = nl.ndarray((bh, dk, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    for idx in nl.affine_range(bh):
+        state = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=state, src=state_ref[idx, :, :])
+
+        for i in nl.sequential_range(nc):
+            # Stationary/moving matmul operands load as bf16 (host pre-cast).
+            kcd_t = nl.ndarray((dk, c), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=kcd_t, src=k_cumdecay_t_ref[idx, i, :, :])
+            qg_t = nl.ndarray((dk, c), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=qg_t, src=qg_t_ref[idx, i, :, :])
+            ait = nl.ndarray((c, c), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=ait, src=attn_intra_t_ref[idx, i, :, :])
+            kd = nl.ndarray((c, dk), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=kd, src=k_decay_ref[idx, i, :, :])
+            # value stays fp32 for an accurate v - v_prime subtraction.
+            v = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=v, src=value_ref[idx, i, :, :])
+
+            # bf16 view of the fp32 recurrent state for the two state matmuls.
+            state_bf = nl.ndarray((dk, dv), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(state_bf, state)
+
+            # 1. v_prime[C, Dv] = k_cumdecay_i[C, Dk] @ S  (contract Dk = partition).
+            vp_psum = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(vp_psum, kcd_t, state_bf)
+            vp = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(vp, vp_psum)
+
+            # 2. v_new = value_i - v_prime  (fp32).
+            v_new = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(v_new, v, vp, op=nl.subtract)
+            v_new_bf = nl.ndarray((c, dv), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(v_new_bf, v_new)
+
+            # 3. attn_inter[C, Dv] = (q_i*exp(g_i))[C, Dk] @ S  (contract Dk).
+            ai_psum = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(ai_psum, qg_t, state_bf)
+            ai = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(ai, ai_psum)
+
+            # 4. core_i = attn_inter + attn_intra_i @ v_new  (contract C = partition).
+            tmp_psum = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(tmp_psum, ait, v_new_bf)
+            tmp = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(tmp, tmp_psum)
+            core = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(core, ai, tmp, op=nl.add)
+            nisa.dma_copy(dst=out_ref[idx, i, :, :], src=core)
+
+            # 5. state_update[Dk, Dv] = k_decay_i^T @ v_new  (contract C = partition).
+            su_psum = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(su_psum, kd, v_new_bf)
+            su = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(su, su_psum)
+
+            # 6. S = S * exp(g_last_i) + state_update  (fp32 recurrence).
+            g_bc = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=g_bc, src=g_last_bc_ref[idx, i, :])
+            nisa.tensor_scalar(state, state, nl.multiply, g_bc)
+            nisa.tensor_tensor(state, state, su, op=nl.add)
+
+        nisa.dma_copy(dst=final_state_ref[idx, :, :], src=state)
+
+    return out_ref, final_state_ref
+
+
+@nki.jit(mode="torchxla")
 def nki_chunk_gated_delta_rule_kernel_v3(
     value_ref,
     k_cumdecay_t_ref,

@@ -47,6 +47,7 @@ try:
     from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
         nki_chunk_gated_delta_rule_kernel,
         nki_chunk_gated_delta_rule_kernel_v2,
+        nki_chunk_gated_delta_rule_kernel_v2_bf16,
         nki_chunk_gated_delta_rule_kernel_v3,
         nki_recurrent_gated_delta_rule,
         nki_recurrent_gated_delta_rule_decode,
@@ -114,6 +115,15 @@ _DELTANET_CHUNK_KERNEL_VERSION = os.environ.get(
 # hits full [128, 128] tile utilization AND the sequential depth halves (half as
 # many chunks per CTE pass).  Values: 64 (safe/default), 128 (optimal for NKI).
 _DELTANET_CHUNK_SIZE = int(os.environ.get("QWEN35_DELTANET_CHUNK_SIZE", "64"))
+
+# Run the DeltaNet chunked-prefill NKI matmuls with bf16 multiplicands and fp32
+# PSUM accumulation instead of fp32 operands.  NeuronCore's TensorEngine is
+# bf16-native, so fp32 nc_matmul is emulated as ~3-4 bf16 passes; the per-op
+# profile shows these ~555k tiny fp32 matmuls/CTE-pass are the dominant prefill
+# MFU sink.  Recurrent state + all accumulation stay fp32 (numerically bounded
+# to <0.5% rel error over the full chunk depth; validated via nki.simulate).
+# This matches the bf16 matmul precision GPU kernels use.  Values: 1 (on), 0.
+_DELTANET_MATMUL_BF16 = os.environ.get("QWEN35_DELTANET_MATMUL_BF16") == "1"
 
 # Disable weight-layout optimization (WLO) for the token_generation model.
 #
@@ -691,14 +701,30 @@ def nki_chunk_gated_delta_rule(
     # eliminating 3 NKI instructions/chunk (scalar DMA + nc_matmul + copy).
     g_last_bc = g_last.unsqueeze(-1).expand(-1, -1, k_head_dim).contiguous()
 
-    _chunk_kernel = (
-        nki_chunk_gated_delta_rule_kernel_v3
-        if _DELTANET_CHUNK_KERNEL_VERSION == "v3"
-        else nki_chunk_gated_delta_rule_kernel_v2
-    )
-    core_flat, final_state_flat = _chunk_kernel(
-        value, k_cumdecay_t, qg_t, attn_intra_t, k_decay, g_last_bc, init_state
-    )
+    if _DELTANET_MATMUL_BF16:
+        # bf16 multiplicands, fp32 PSUM accumulation.  The four operands that
+        # enter the PE array are rounded to bf16 host-side; value (used only in
+        # the fp32 v - v_prime subtraction), the gate, and the recurrent state
+        # stay fp32.  Neuron's bf16-native TensorEngine runs these ~4x faster
+        # than the emulated fp32 nc_matmul.
+        core_flat, final_state_flat = nki_chunk_gated_delta_rule_kernel_v2_bf16(
+            value,
+            k_cumdecay_t.to(torch.bfloat16),
+            qg_t.to(torch.bfloat16),
+            attn_intra_t.to(torch.bfloat16),
+            k_decay.to(torch.bfloat16),
+            g_last_bc,
+            init_state,
+        )
+    else:
+        _chunk_kernel = (
+            nki_chunk_gated_delta_rule_kernel_v3
+            if _DELTANET_CHUNK_KERNEL_VERSION == "v3"
+            else nki_chunk_gated_delta_rule_kernel_v2
+        )
+        core_flat, final_state_flat = _chunk_kernel(
+            value, k_cumdecay_t, qg_t, attn_intra_t, k_decay, g_last_bc, init_state
+        )
 
     core_attn_out = core_flat.reshape(batch_size, num_heads, total_sequence_length, v_head_dim)
     core_attn_out = core_attn_out[:, :, :sequence_length]

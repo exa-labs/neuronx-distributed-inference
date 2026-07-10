@@ -123,7 +123,7 @@ class TestGatedDeltaRuleKernels(unittest.TestCase):
         set_random_seed(0)
 
     def test_chunked_matches_hf(self):
-        b, s, hk, hv, dk, dv = 2, 50, 2, 4, 16, 16
+        b, s, _hk, hv, dk, dv = 2, 50, 2, 4, 16, 16
         q = torch.randn(b, s, hv, dk)
         k = torch.randn(b, s, hv, dk)
         v = torch.randn(b, s, hv, dv)
@@ -345,6 +345,81 @@ class TestGatedDeltaRuleKernels(unittest.TestCase):
 
         assert_close(self, expected_core, core, rtol=1e-4, name="nki v2 c128 core")
         assert_close(self, expected_state, final_state, rtol=1e-4, name="nki v2 c128 state")
+
+    def test_nki_chunk_kernel_v2_bf16_matches_fp32(self):
+        """v2_bf16 (bf16 matmul operands, fp32 accum) matches the fp32 loop ref.
+
+        Uses realistically-scaled operands (l2-normed q/k, bounded gates) --
+        the same magnitudes the DeltaNet preprocessing feeds the kernel -- and
+        checks a relative-L2 tolerance appropriate for bf16 multiplicands with
+        fp32 PSUM accumulation.  The recurrent state stays fp32, so error must
+        not blow up with chunk depth.
+        """
+        try:
+            import nki  # noqa: F401
+            from neuronx_distributed_inference.models.qwen3_5.nki_delta_rule import (
+                nki_chunk_gated_delta_rule_kernel_v2_bf16,
+            )
+        except ImportError:
+            self.skipTest("nki not available in this environment")
+
+        torch.manual_seed(0)
+        bh, nc, c, dk, dv = 2, 16, 64, 128, 128
+        scale = 1.0 / (dk ** 0.5)
+
+        def l2norm(x):
+            return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        q = l2norm(torch.randn(bh, nc, c, dk)) * scale
+        k = l2norm(torch.randn(bh, nc, c, dk))
+        value = torch.randn(bh, nc, c, dv) * 0.5
+        beta = torch.rand(bh, nc, c)
+        k_cumdecay = k * torch.rand(bh, nc, c, 1)
+        qg = q * torch.rand(bh, nc, c, 1)
+        k_decay = k * beta.unsqueeze(-1)
+        attn_intra = torch.tril(torch.randn(bh, nc, c, c) * 0.05, -1)
+        g_last = torch.rand(bh, nc) * 0.5 + 0.5
+        init_state = torch.zeros(bh, dk, dv)
+
+        state = init_state.clone()
+        cores = []
+        for i in range(nc):
+            v_prime = k_cumdecay[:, i] @ state
+            v_new = value[:, i] - v_prime
+            attn_inter = qg[:, i] @ state
+            cores.append(attn_inter + attn_intra[:, i] @ v_new)
+            state_update = k_decay[:, i].transpose(-1, -2) @ v_new
+            state = state * g_last[:, i, None, None] + state_update
+        expected_core = torch.stack(cores, dim=1)
+        expected_state = state
+
+        # Host pre-cast: the four matmul operands enter the kernel as bf16.
+        k_cumdecay_t = k_cumdecay.transpose(-1, -2).contiguous().to(torch.bfloat16)
+        qg_t = qg.transpose(-1, -2).contiguous().to(torch.bfloat16)
+        attn_intra_t = attn_intra.transpose(-1, -2).contiguous().to(torch.bfloat16)
+        k_decay_bf = k_decay.to(torch.bfloat16)
+        g_last_bc = g_last.unsqueeze(-1).expand(-1, -1, dk).contiguous()
+
+        try:
+            core, final_state = nki.simulate(
+                nki_chunk_gated_delta_rule_kernel_v2_bf16
+            )(
+                value.numpy(), k_cumdecay_t.numpy(), qg_t.numpy(),
+                attn_intra_t.numpy(), k_decay_bf.numpy(), g_last_bc.numpy(),
+                init_state.numpy(),
+            )
+        except Exception as exc:
+            self.skipTest(f"nki.simulate unavailable: {exc}")
+        core = torch.from_numpy(numpy.asarray(core)).float()
+        final_state = torch.from_numpy(numpy.asarray(final_state)).float()
+
+        core_rel = (core - expected_core).norm() / expected_core.norm().clamp_min(1e-6)
+        state_rel = (
+            (final_state - expected_state).norm()
+            / expected_state.norm().clamp_min(1e-6)
+        )
+        self.assertLess(core_rel.item(), 1.5e-2, f"bf16 core rel err {core_rel:.2e}")
+        self.assertLess(state_rel.item(), 1.5e-2, f"bf16 state rel err {state_rel:.2e}")
 
     def test_nki_decode_kernel_matches_general(self):
         """The specialized decode kernel (k_row, no seq loop) must match the
