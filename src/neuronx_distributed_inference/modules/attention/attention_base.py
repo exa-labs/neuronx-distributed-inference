@@ -69,7 +69,10 @@ from .gqa import GQA, GroupQueryAttention_O, GroupQueryAttention_QKV  # noqa: E4
 from nkilib.experimental.transformer.attention_block_tkg import attention_block_tkg
 from nkilib.core.utils.common_types import QuantizationType
 
-from .tkg_attn_nki import tkg_attention_kernel_batched
+try:
+    from .tkg_attn_nki import tkg_attention_kernel_batched
+except Exception:  # keep the baseline decode path import-safe if NKI is unavailable
+    tkg_attention_kernel_batched = None
 
 
 def tkg_attn_nki_enabled() -> bool:
@@ -1477,6 +1480,11 @@ class NeuronAttentionBase(nn.Module):
         Numerically matches compute_for_token_gen: same scores, mask semantics,
         and softmax over [prior || active], with fp32 accumulators in-kernel.
         """
+        if tkg_attention_kernel_batched is None:
+            raise RuntimeError(
+                "NXDI_TKG_ATTN_NKI=1 but the from-scratch token-gen NKI kernel "
+                "failed to import; cannot use the fused decode-attention path."
+            )
         bsz, num_heads, _, head_dim = Q.shape
         K_prior = past_key_value[0]
         V_prior = past_key_value[1]
