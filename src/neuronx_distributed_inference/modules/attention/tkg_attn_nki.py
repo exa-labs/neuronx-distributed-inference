@@ -38,7 +38,17 @@ def _transpose_sbuf(x):
     ``nl.transpose`` emits into PSUM and ``nl.copy`` preserves the source buffer,
     so a matmul stationary operand (which must live in SBUF) needs an explicit
     SBUF destination; assigning through ``[...]`` honours the destination buffer.
+
+    ``nl.transpose`` lowers to ``nc_matmul`` in transpose mode, whose destination
+    dtype must be float32 on gen2 (Inferentia2) -- a bf16 source (e.g. a raw Q/K
+    load) is rejected with "nc_matmul (transpose mode) dst dtype must be float32".
+    So upcast a non-fp32 source to fp32 SBUF first; this also keeps QK^T / P.V
+    accumulating in fp32 for HF equivalence.
     """
+    if x.dtype != nl.float32:
+        xf = nl.ndarray((x.shape[0], x.shape[1]), dtype=nl.float32, buffer=nl.sbuf)
+        xf[...] = x
+        x = xf
     xt = nl.transpose(x)                                   # [x1, x0] in PSUM
     # fp32 so it can serve as a Tensor-Engine matmul stationary (dst dtype must
     # be fp32/bf16) and so QK^T / P.V accumulate in fp32 (HF equivalence).
