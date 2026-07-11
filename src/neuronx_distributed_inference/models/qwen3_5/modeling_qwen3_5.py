@@ -150,6 +150,31 @@ _DELTANET_MATMUL_BF16 = os.environ.get("QWEN35_DELTANET_MATMUL_BF16") == "1"
 # than the cross-graph layout pass (e.g. a runtime interaction through the
 # shared on-device state buffers).  cte512 + chunk_size=64 remains the only
 # validated pairing.
+#
+# WONTFIX (root cause is in neuronx-cc, outside this repo).  Exhaustive
+# code-level elimination of every buffer we own proves the decode OOB cannot
+# originate in our Python model or config:
+#   * KV cache is sized by neuron_config.max_length (kv_cache_manager.py:197),
+#     NOT cte_bucket.
+#   * DeltaNet conv_state / recurrent_state are sized by max_batch_size and the
+#     head dims (this file, ~L1143-1154), NOT cte_bucket or chunk_size.
+#   * The decode fast-path (seq_len==1) operates on state_flat shaped purely by
+#     batch/heads/head_dim (this file, ~L835); it never reads cte_bucket or
+#     chunk_size.
+#   * token_generation_buckets is pinned to [max_model_len] independently of the
+#     context_encoding_buckets=[cte_bucket] list (workflow_vllm.py:681-682), so
+#     the decode NEFF's own bucket shape is already invariant to cte_bucket.
+# Yet chunk_size=128 at a *fixed* cte512 (a prefill-graph-only change that
+# touches none of the above) still faults the decode NEFF with the identical
+# status=1006.  The only variable is the shape of the *prefill* graph the
+# decode NEFF is co-compiled/co-loaded with, which means neuronx-cc packs the
+# two NEFFs' scratchpad/DMA-descriptor arenas together and picks decode-NEFF
+# offsets that go out of bounds whenever the prefill graph changes shape.  That
+# packing is internal to the closed-source compiler/runtime; we cannot patch it.
+# Consequence: prefill MFU is hard-capped because the only levers that widen the
+# DeltaNet matmul M-dimension (chunk_size>64, cte_bucket>512 → fewer/larger
+# passes) all trip this compiler bug.  Escalation path is an AWS neuronx-cc
+# ticket with the minimal repro (cte512+cs64 loads; cte512+cs128 faults decode).
 _DELTANET_DISABLE_TKG_WLT = os.environ.get("QWEN35_DISABLE_TKG_WLT") == "1"
 
 # Fully shard the DeltaNet projections across ranks (in_proj ColumnParallel) in
