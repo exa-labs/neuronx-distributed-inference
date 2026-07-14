@@ -113,7 +113,13 @@ _DELTANET_CHUNK_KERNEL_VERSION = os.environ.get(
 # At chunk_size=64 (HF default), the matmuls that contract the chunk dim use
 # partition=64 — half the tensor engine's width.  At chunk_size=128 every matmul
 # hits full [128, 128] tile utilization AND the sequential depth halves (half as
-# many chunks per CTE pass).  Values: 64 (safe/default), 128 (optimal for NKI).
+# many chunks per CTE pass).  Values: 64 (HF default), 128 (measured optimum,
+# and the hard maximum: the chunk dim maps to a nc_matmul partition, so
+# chunk_size=256 fails to compile with "dma_copy dst partition dimension 256
+# exceeds maximum 128").  chunk_size=128 at cte512 is the validated throughput
+# peak on inf2.xlarge (117.86 tok/s vs 114.82 at cs64, +2.6%; 60/60 requests x
+# 500 tokens, ok=true) and is decode-safe -- see the note above _DELTANET_
+# DISABLE_TKG_WLT below for why the earlier "cs128 faults decode" claim was wrong.
 _DELTANET_CHUNK_SIZE = int(os.environ.get("QWEN35_DELTANET_CHUNK_SIZE", "64"))
 
 # Run the DeltaNet chunked-prefill NKI matmuls with bf16 multiplicands and fp32
@@ -130,51 +136,47 @@ _DELTANET_MATMUL_BF16 = os.environ.get("QWEN35_DELTANET_MATMUL_BF16") == "1"
 # NxD compiles token_generation as the "priority" model (priority_model_idx=0),
 # which runs a weight-layout-optimization pass and then rewrites the *other*
 # HLOs (the context-encoding / prefill model) to consume weights in that layout
-# (ModelBuilder._add_layout_optimization_to_remaining_hlo).  Empirically the
-# resulting token_generation NEFF is NOT invariant to the CTE-graph shape: its
-# module hash changes whenever the prefill graph changes (larger cte_bucket, or
-# deltanet chunk_size=128), and those variants fault the decode NEFF at runtime
-# with `status=1006 Execution Out-Of-Bounds Memory Access` even though the decode
-# code path itself is independent of both cte_bucket and chunk_size.  cte512 +
-# chunk_size=64 is the only pairing whose WLO'd decode NEFF is well-formed, which
-# is exactly why every attempt to raise prefill MFU (bigger buckets / wider
-# chunks) has been blocked.  Setting this to "1" passes
-# enable_wlt_optimization=False so token_generation is compiled from its own HLO
-# with no cross-graph layout coupling, decoupling the decode NEFF from the
-# prefill config at the cost of a small decode-only layout-opt regression.
+# (ModelBuilder._add_layout_optimization_to_remaining_hlo).  When the prefill
+# graph changes shape (larger cte_bucket, or deltanet chunk_size=128) the
+# co-compiled token_generation NEFF's *warmup* pass emits a
+# `status=1006 Execution Out-Of-Bounds Memory Access`.  Setting this to "1"
+# passes enable_wlt_optimization=False so token_generation is compiled from its
+# own HLO with no cross-graph layout coupling, at the cost of a small
+# decode-only layout-opt regression.
 #
-# Measured result: this flag does NOT fix the chunk_size=128 decode fault.  With
-# WLT disabled (log-confirmed "Can't find a priority model, skip optimizing
-# weight layout for other HLOs") the cs128 + cte512 decode NEFF still faults
-# with the identical status=1006 OOB, so the corruption mechanism is deeper
-# than the cross-graph layout pass (e.g. a runtime interaction through the
-# shared on-device state buffers).  cte512 + chunk_size=64 remains the only
-# validated pairing.
+# IMPORTANT -- the warmup OOB is NOT always fatal, and an earlier note here was
+# wrong to conclude "cs128 faults decode / cte512+cs64 is the only pairing."
+# Corrected, measured on real inf2.xlarge (tp2, batch16, 7500/500, 60 requests):
+#   * cte512 + chunk_size=128: the token_generation warmup emits the status=1006
+#     OOB (NxD catches it and logs "safe to ignore"), but the real closed loop
+#     then runs clean -- 60/60 requests x 500 tokens, ok=true, 117.86 tok/s.
+#     The dummy warmup input hits an out-of-bounds decode bucket; the actual
+#     in-bounds decode does not.  So chunk_size=128 is shipped as the default.
+#   * cte_bucket>512 (1024 tested): the fault is FATAL -- the engine dies mid
+#     benchmark with EngineDeadError, real decode genuinely reads OOB.  Disabling
+#     WLT here does NOT help: cte1024 + QWEN35_DISABLE_TKG_WLT=1 still crashes
+#     real decode identically, so the corruption is deeper than the cross-graph
+#     layout pass (a runtime interaction through the shared on-device arenas).
 #
-# WONTFIX (root cause is in neuronx-cc, outside this repo).  Exhaustive
-# code-level elimination of every buffer we own proves the decode OOB cannot
-# originate in our Python model or config:
+# WONTFIX for cte_bucket>512 only (root cause is in neuronx-cc, outside this
+# repo).  Exhaustive code-level elimination of every buffer we own shows the
+# decode OOB cannot originate in our Python model or config:
 #   * KV cache is sized by neuron_config.max_length (kv_cache_manager.py:197),
 #     NOT cte_bucket.
 #   * DeltaNet conv_state / recurrent_state are sized by max_batch_size and the
-#     head dims (this file, ~L1143-1154), NOT cte_bucket or chunk_size.
+#     head dims (this file), NOT cte_bucket or chunk_size.
 #   * The decode fast-path (seq_len==1) operates on state_flat shaped purely by
-#     batch/heads/head_dim (this file, ~L835); it never reads cte_bucket or
-#     chunk_size.
+#     batch/heads/head_dim; it never reads cte_bucket or chunk_size.
 #   * token_generation_buckets is pinned to [max_model_len] independently of the
-#     context_encoding_buckets=[cte_bucket] list (workflow_vllm.py:681-682), so
-#     the decode NEFF's own bucket shape is already invariant to cte_bucket.
-# Yet chunk_size=128 at a *fixed* cte512 (a prefill-graph-only change that
-# touches none of the above) still faults the decode NEFF with the identical
-# status=1006.  The only variable is the shape of the *prefill* graph the
-# decode NEFF is co-compiled/co-loaded with, which means neuronx-cc packs the
-# two NEFFs' scratchpad/DMA-descriptor arenas together and picks decode-NEFF
-# offsets that go out of bounds whenever the prefill graph changes shape.  That
-# packing is internal to the closed-source compiler/runtime; we cannot patch it.
-# Consequence: prefill MFU is hard-capped because the only levers that widen the
-# DeltaNet matmul M-dimension (chunk_size>64, cte_bucket>512 → fewer/larger
-# passes) all trip this compiler bug.  Escalation path is an AWS neuronx-cc
-# ticket with the minimal repro (cte512+cs64 loads; cte512+cs128 faults decode).
+#     context_encoding_buckets=[cte_bucket] list (workflow_vllm.py), so the
+#     decode NEFF's own bucket shape is already invariant to cte_bucket.
+# The only variable is the shape of the *prefill* graph the decode NEFF is
+# co-compiled/co-loaded with: neuronx-cc packs the two NEFFs' scratchpad/DMA
+# arenas together and, at cte_bucket>512, picks decode-NEFF offsets that go out
+# of bounds.  That packing is internal to the closed-source compiler/runtime; we
+# cannot patch it.  Escalation path is an AWS neuronx-cc ticket with the minimal
+# repro (cte512 loads & decodes; cte1024 faults real decode, WLT on or off).
+# This flag is retained as the lever used to prove WLT is not the cause.
 _DELTANET_DISABLE_TKG_WLT = os.environ.get("QWEN35_DISABLE_TKG_WLT") == "1"
 
 # Fully shard the DeltaNet projections across ranks (in_proj ColumnParallel) in
