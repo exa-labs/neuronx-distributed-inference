@@ -282,7 +282,10 @@ from neuronx_distributed.parallel_layers.layers import (  # noqa: E402
     RowParallelLinear,
     SPMDRank,
 )
-from neuronx_distributed.parallel_layers.mappings import _gather_along_dim  # noqa: E402
+from neuronx_distributed.parallel_layers.mappings import (  # noqa: E402
+    _gather_along_dim,
+    reduce_from_tensor_model_parallel_region,
+)
 
 from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig  # noqa: E402
 from neuronx_distributed_inference.models.model_base import (  # noqa: E402
@@ -295,8 +298,24 @@ from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402
     DecoderModelInstance,
     ModelWrapper,
 )
-from neuronx_distributed_inference.modules.attention.utils import manual_softmax  # noqa: E402
+from neuronx_distributed_inference.modules.attention.utils import (  # noqa: E402
+    manual_softmax,
+    transpose_parallel_linear_layer,
+)
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module  # noqa: E402
+
+# Fused SwiGLU MLP NKI kernel (RMSNorm+gate+up+SiLU+down in one kernel, avoids
+# materializing the ~intermediate-size activation between projections). Opt-in
+# via QWEN35_FUSED_MLP_KERNEL=1; only exercised on-device (not on_cpu).
+_FUSED_MLP_KERNEL = os.environ.get("QWEN35_FUSED_MLP_KERNEL", "0") == "1"
+try:
+    from nkilib.core.mlp.mlp import mlp as _nki_fused_mlp  # noqa: E402
+    from nkilib.core.utils.common_types import ActFnType as _ActFnType  # noqa: E402
+    from nkilib.core.utils.common_types import NormType as _NormType  # noqa: E402
+except Exception:  # nkilib unavailable (e.g. CPU-only env); kernel stays off
+    _nki_fused_mlp = None
+    _ActFnType = None
+    _NormType = None
 
 
 def _get_tp_degree():
@@ -1649,6 +1668,8 @@ class NeuronQwen3_5MLP(nn.Module):
     def __init__(self, config: Qwen3_5InferenceConfig, intermediate_size: int):
         super().__init__()
         dtype = config.neuron_config.torch_dtype
+        self.hidden_size = config.hidden_size
+        self.rms_norm_eps = config.rms_norm_eps
         self.gate_proj = ColumnParallelLinear(
             config.hidden_size, intermediate_size, bias=False, gather_output=False, dtype=dtype
         )
@@ -1659,7 +1680,46 @@ class NeuronQwen3_5MLP(nn.Module):
             intermediate_size, config.hidden_size, bias=False, input_is_parallel=True, dtype=dtype
         )
 
+        # Opt-in fused SwiGLU MLP NKI kernel. Only valid on-device, in the
+        # non-quantized (bf16) config, and once model parallelism is set up.
+        self.fused_mlp_kernel = (
+            _FUSED_MLP_KERNEL
+            and _nki_fused_mlp is not None
+            and not getattr(config.neuron_config, "on_cpu", False)
+            and not getattr(config.neuron_config, "quantized", False)
+            and parallel_state.model_parallel_is_initialized()
+        )
+        if self.fused_mlp_kernel:
+            self.logical_nc_config = getattr(
+                config.neuron_config, "logical_nc_config", 1
+            )
+            # The kernel expects (in, out) weight layout.
+            self.gate_proj.weight = transpose_parallel_linear_layer(self.gate_proj.weight)
+            self.up_proj.weight = transpose_parallel_linear_layer(self.up_proj.weight)
+            self.down_proj.weight = transpose_parallel_linear_layer(self.down_proj.weight)
+
+    def _fused_forward(self, x):
+        # Input is already RMSNorm'd by the decoder layer, so NO_NORM; the
+        # residual add also happens outside, so no fused residual here.
+        norm_weights = torch.zeros(
+            size=(1, self.hidden_size), dtype=x.dtype, device=x.device
+        )
+        output_tensor = _nki_fused_mlp[self.logical_nc_config](
+            hidden_tensor=x,
+            gate_proj_weights_tensor=self.gate_proj.weight.data,
+            up_proj_weights_tensor=self.up_proj.weight.data,
+            down_proj_weights_tensor=self.down_proj.weight.data,
+            normalization_weights_tensor=norm_weights,
+            normalization_type=_NormType.NO_NORM,
+            eps=self.rms_norm_eps,
+            activation_fn=_ActFnType.SiLU,
+        )
+        # down_proj is row-parallel: sum the per-rank partials.
+        return reduce_from_tensor_model_parallel_region(output_tensor)
+
     def forward(self, x):
+        if self.fused_mlp_kernel:
+            return self._fused_forward(x)
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
