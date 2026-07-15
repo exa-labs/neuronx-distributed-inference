@@ -1242,6 +1242,100 @@ def nki_chunk_gated_delta_rule_kernel_v2_bf16(
 
 
 @nki.jit(mode="torchxla")
+def nki_chunk_gated_delta_rule_kernel_v4_bf16(
+    value_ref,
+    k_cumdecay_t_ref,
+    qg_t_ref,
+    attn_intra_t_ref,
+    k_decay_ref,
+    g_last_bc_ref,
+    state_ref,
+):
+    """v2_bf16 with the per-chunk PSUM->SBUF copies folded into their consumers.
+
+    Numerically identical to ``..._v2_bf16`` (same bf16 multiplicands, same fp32
+    PSUM accumulation, same fp32 recurrence).  The only change is instruction
+    scheduling: instead of copying each ``nc_matmul`` PSUM result to an SBUF tile
+    and then reading that tile, the downstream vector op reads the PSUM bank
+    directly.  This removes 3 ``tensor_copy`` ops per chunk (``vp``, ``ai``,
+    ``su``), shortening the intra-chunk dependency chain that stalls the
+    TensorEngine between the four matmuls.
+
+    Per-chunk vector-engine ops drop from 8 to 5; matmul count and precision are
+    unchanged.  With BH heads x NC chunks x 24 DeltaNet layers x ~15 CTE passes,
+    this is a large reduction in Act/Pool-engine instructions on the DeltaNet
+    prefill critical path.
+
+    Reading PSUM directly is valid for vector/scalar ops; at most three PSUM
+    banks are live at once (vp, ai/tmp, su), well within the 8-bank budget.
+
+    Args/returns match ``..._v2_bf16``.
+    """
+    bh = value_ref.shape[0]
+    nc = value_ref.shape[1]
+    c = value_ref.shape[2]
+    dv = value_ref.shape[3]
+    dk = k_decay_ref.shape[3]
+
+    out_ref = nl.ndarray((bh, nc, c, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+    final_state_ref = nl.ndarray((bh, dk, dv), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    for idx in nl.affine_range(bh):
+        state = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=state, src=state_ref[idx, :, :])
+
+        for i in nl.sequential_range(nc):
+            kcd_t = nl.ndarray((dk, c), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=kcd_t, src=k_cumdecay_t_ref[idx, i, :, :])
+            qg_t = nl.ndarray((dk, c), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=qg_t, src=qg_t_ref[idx, i, :, :])
+            ait = nl.ndarray((c, c), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=ait, src=attn_intra_t_ref[idx, i, :, :])
+            kd = nl.ndarray((c, dk), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=kd, src=k_decay_ref[idx, i, :, :])
+            v = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=v, src=value_ref[idx, i, :, :])
+
+            state_bf = nl.ndarray((dk, dv), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(state_bf, state)
+
+            # 1. v_prime[C, Dv] = k_cumdecay_i @ S; fold PSUM read into v_new.
+            vp_psum = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(vp_psum, kcd_t, state_bf)
+            v_new = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(v_new, v, vp_psum, op=nl.subtract)
+            v_new_bf = nl.ndarray((c, dv), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(v_new_bf, v_new)
+
+            # 2. attn_inter[C, Dv] = (q_i*exp(g_i)) @ S  (kept in PSUM).
+            ai_psum = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(ai_psum, qg_t, state_bf)
+
+            # 3. core_i = attn_inter + attn_intra_i @ v_new; add reads ai_psum.
+            tmp_psum = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(tmp_psum, ait, v_new_bf)
+            tmp = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(tmp, tmp_psum)
+            core = nl.ndarray((c, dv), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(core, tmp, ai_psum, op=nl.add)
+            nisa.dma_copy(dst=out_ref[idx, i, :, :], src=core)
+
+            # 4. state_update[Dk, Dv] = k_decay_i^T @ v_new  (kept in PSUM).
+            su_psum = nl.ndarray((dk, dv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(su_psum, kd, v_new_bf)
+
+            # 5. S = S * exp(g_last_i) + state_update; add reads su_psum.
+            g_bc = nl.ndarray((dk, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=g_bc, src=g_last_bc_ref[idx, i, :])
+            nisa.tensor_scalar(state, state, nl.multiply, g_bc)
+            nisa.tensor_tensor(state, state, su_psum, op=nl.add)
+
+        nisa.dma_copy(dst=final_state_ref[idx, :, :], src=state)
+
+    return out_ref, final_state_ref
+
+
+@nki.jit(mode="torchxla")
 def nki_chunk_gated_delta_rule_kernel_v3(
     value_ref,
     k_cumdecay_t_ref,

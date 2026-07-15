@@ -49,6 +49,7 @@ try:
         nki_chunk_gated_delta_rule_kernel_v2,
         nki_chunk_gated_delta_rule_kernel_v2_bf16,
         nki_chunk_gated_delta_rule_kernel_v3,
+        nki_chunk_gated_delta_rule_kernel_v4_bf16,
         nki_recurrent_gated_delta_rule,
         nki_recurrent_gated_delta_rule_decode,
         nki_recurrent_gated_delta_rule_decode_v2,
@@ -102,8 +103,11 @@ _DELTANET_SHARD_PREFILL = os.environ.get("QWEN35_DELTANET_SHARD_PREFILL") == "1"
 # XLA trace entirely.
 _DELTANET_CHUNK_PREFILL = os.environ.get("QWEN35_DELTANET_CHUNK_PREFILL", "")
 
-# NKI chunked kernel version: "v2" (default, affine_range — sequential heads) or
-# "v3" (parallel_range — compiler can overlap DMA across heads for pipelining).
+# NKI chunked kernel version:
+#   "v2" (default, affine_range — sequential heads),
+#   "v3" (parallel_range — compiler can overlap DMA across heads; fp32 path only),
+#   "v4" (bf16 path only — v2_bf16 with per-chunk PSUM->SBUF copies folded into
+#        their consumers, shortening the intra-chunk dependency chain).
 _DELTANET_CHUNK_KERNEL_VERSION = os.environ.get(
     "QWEN35_DELTANET_CHUNK_KERNEL_VERSION", "v2"
 )
@@ -733,8 +737,14 @@ def nki_chunk_gated_delta_rule(
         # enter the PE array are rounded to bf16 host-side; value (used only in
         # the fp32 v - v_prime subtraction), the gate, and the recurrent state
         # stay fp32.  Neuron's bf16-native TensorEngine runs these ~4x faster
-        # than the emulated fp32 nc_matmul.
-        core_flat, final_state_flat = nki_chunk_gated_delta_rule_kernel_v2_bf16(
+        # than the emulated fp32 nc_matmul.  "v4" folds the per-chunk PSUM->SBUF
+        # copies into their consumers (numerically identical, shorter dep chain).
+        _bf16_kernel = (
+            nki_chunk_gated_delta_rule_kernel_v4_bf16
+            if _DELTANET_CHUNK_KERNEL_VERSION == "v4"
+            else nki_chunk_gated_delta_rule_kernel_v2_bf16
+        )
+        core_flat, final_state_flat = _bf16_kernel(
             value,
             k_cumdecay_t.to(torch.bfloat16),
             qg_t.to(torch.bfloat16),
