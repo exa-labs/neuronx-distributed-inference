@@ -1269,6 +1269,13 @@ def nki_chunk_gated_delta_rule_kernel_v4_bf16(
     Reading PSUM directly is valid for vector/scalar ops; at most three PSUM
     banks are live at once (vp, ai/tmp, su), well within the 8-bank budget.
 
+    Measured (inf2.xlarge tp2, batch16, 7500/500, 60 req, SDK 2.26, cs128):
+    **113.24 output tok/s -- a regression vs the v2_bf16 default (120.30).**
+    Folding the copies keeps PSUM banks live across the intervening matmul,
+    which lengthens PSUM-bank lifetime and constrains the compiler's matmul
+    scheduling more than the removed vector copies cost.  Kept opt-in behind
+    QWEN35_DELTANET_CHUNK_KERNEL_VERSION=v4 for reference; do NOT default it.
+
     Args/returns match ``..._v2_bf16``.
     """
     bh = value_ref.shape[0]
