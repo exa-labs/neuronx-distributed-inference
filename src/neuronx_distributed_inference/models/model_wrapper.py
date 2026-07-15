@@ -158,7 +158,7 @@ class ModelWrapper(torch.nn.Module):
 
         if hlo2tensorizer:
             self.compiler_args += f" --internal-hlo2tensorizer-options='{hlo2tensorizer} --verify-hlo=true' "
-        else:
+        elif "--internal-hlo2tensorizer-options" not in self.compiler_args:
             self.compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true' "
 
         if self.neuron_config.enable_output_completion_notifications:
@@ -596,6 +596,54 @@ class ModelWrapper(torch.nn.Module):
                 block_kv_empty_args = args[5:11]
                 block_kv_slot_mapping = args[11]
                 block_kv_args = args[12:15]
+
+        if (
+            self.tag == CONTEXT_ENCODING_MODEL_TAG
+            and not self.is_prefix_caching
+            and self.neuron_config.is_continuous_batching
+            and self.neuron_config.batch_size < self.neuron_config.max_batch_size
+        ):
+            # Batched context encoding (ctx_batch_size > 1, smaller than the
+            # decode batch): the generic pad path below sorts/permutes rows
+            # assuming seq_id values < compiled batch size, but CTE KV slots
+            # range over max_batch_size, so both the input index_select and the
+            # output un-permute would read out of range.  The const-indices KV
+            # scatter keys writes on seq_id *values*, so row order is
+            # irrelevant: pad rows repeat request 0 (same input -> same KV) and
+            # duplicate its slot, making the extra scatter writes idempotent.
+            # Outputs stay in request order; padding is sliced off the end.
+            n = seq_ids.shape[0]
+            pad_n = self.neuron_config.batch_size - n
+            padded_args = []
+            for arg in args[0:3]:
+                if is_ranked_io(arg):
+                    padded_args.append(arg)
+                else:
+                    padded_args.append(
+                        self._pad_helper(arg, pad_type="repeat_first_batchline")
+                    )
+            padded_args.append(torch.cat([seq_ids, seq_ids[0:1].repeat(pad_n)]))
+            padded_args.append(
+                self._pad_helper(sampling_params, pad_type="repeat_first_batchline")
+            )
+            for arg in args[5:]:
+                if (
+                    isinstance(arg, torch.Tensor)
+                    and arg.dim() >= 1
+                    and arg.shape[0] == n
+                ):
+                    padded_args.append(
+                        self._pad_helper(arg, pad_type="repeat_first_batchline")
+                    )
+                else:
+                    padded_args.append(arg)
+            outputs = self._forward(*padded_args)
+            if self.is_neuron():
+                if self.async_mode:
+                    return outputs
+                return outputs[:n]
+            logits, *kv_cache = outputs
+            return [logits[:n], *kv_cache]
 
         # pad the inputs up to the compiled batch size in the end
         reorder_seq_ids = not self.is_prefix_caching
