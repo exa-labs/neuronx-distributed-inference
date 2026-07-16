@@ -31,10 +31,16 @@ from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlam
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
 from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
 from neuronx_distributed_inference.modules.attention.attention_base import (
+    FlashAttentionStrategy,
     NeuronAttentionBase,
     tkg_attn_nki_enabled,
 )
-from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding, apply_rotary_pos_emb, manual_softmax
+from neuronx_distributed_inference.modules.attention.utils import (
+    RotaryEmbedding,
+    apply_rotary_pos_emb,
+    manual_softmax,
+    repeat_kv,
+)
 from neuronx_distributed_inference.modules.kvcache.gemma4_kv_cache_manager import Gemma4KVCacheManager
 
 
@@ -466,6 +472,67 @@ class NeuronGemma4Attention(NeuronAttentionBase):
             torch.matmul(self._fold_heads(softmax_active, bsz, q_len), V), bsz, q_len
         )
         return attn_prior + attn_active
+
+    def perform_prefill_windowed_attn(self, Q, K, V, q_len, bsz, attention_mask, window_size):
+        """Banded sliding-window prefill: compute only the in-window K/V tiles.
+
+        The base path materializes the full ``[B, H, S, S]`` score matrix and
+        masks it down to the sliding-window band, so Gemma 4's 28 sliding
+        layers do full O(S^2) causal attention over the whole prompt during
+        context encoding even though each query can only attend within
+        ``window_size``. Here each query tile of ``window_size`` positions
+        attends only to the key/value tiles its window can reach -- the tile
+        itself plus the ``ceil((window_size-1)/tile)`` preceding tiles (one, for
+        ``tile == window_size``) -- and the windowed causal mask is sliced to
+        that band. Every key outside the band is masked to ``-inf`` in the base
+        path (softmax weight 0), so the tiled softmax is mathematically
+        identical; only the wasted out-of-window compute (~7/8 of the matrix at
+        S=4096, window=512) is removed. At S=4096/window=512 this cuts the
+        sliding-layer score+context matmuls from S^2 to ~2*window*S.
+
+        Falls back to the full masked path when disabled, when there is no
+        window/mask, or when a flash kernel would be selected. Gemma 4's
+        head_dim (256 sliding / 512 full) exceeds the flash kernel's
+        head_dim<=128 limit, so the sweep runs with ``attn_kernel_enabled`` off
+        and the native path is the hot path this optimizes.
+        """
+        if (
+            not getattr(self.neuron_config, "gemma4_windowed_prefill", True)
+            or not window_size
+            or attention_mask is None
+            or self.get_flash_attention_strategy(q_len, attention_mask is not None)
+            != FlashAttentionStrategy.NONE
+        ):
+            return super().perform_prefill_windowed_attn(
+                Q, K, V, q_len, bsz, attention_mask, window_size
+            )
+
+        tile = int(window_size)
+        # Preceding tiles a query tile's window reaches (== 1 when tile==window).
+        n_prev = -(-(tile - 1) // tile)
+        K_active = repeat_kv(K, self.num_key_value_groups)
+        V_active = repeat_kv(V, self.num_key_value_groups)
+        neg_inf = torch.finfo(Q.dtype).min
+
+        outputs = []
+        for q_start in range(0, q_len, tile):
+            q_end = min(q_start + tile, q_len)
+            k_start = max(0, q_start - n_prev * tile)
+            # Causal: no query in this tile can attend beyond its own position.
+            k_end = q_end
+
+            q_blk = Q[:, :, q_start:q_end, :]
+            k_blk = K_active[:, :, k_start:k_end, :]
+            v_blk = V_active[:, :, k_start:k_end, :]
+            mask_blk = attention_mask[:, :, q_start:q_end, k_start:k_end]
+
+            scores = torch.matmul(q_blk, k_blk.transpose(2, 3)) / self.softmax_scale
+            scores = torch.where(mask_blk.to(torch.bool), scores, neg_inf)
+            scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
+            outputs.append(torch.matmul(scores, v_blk))
+
+        attn_output = torch.cat(outputs, dim=2)
+        return attn_output, FlashAttentionStrategy.NONE
 
 
 class NeuronGemma4DecoderLayer(nn.Module):
