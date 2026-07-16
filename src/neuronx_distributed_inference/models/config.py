@@ -284,6 +284,13 @@ class NeuronConfig:
         # Windowed Context Encoding
         self.windowed_context_encoding_size = kwargs.pop("windowed_context_encoding_size", None)
 
+        # Gemma4 native banded (windowed) context-encoding attention for the
+        # sliding-window layers. When enabled, sliding layers compute only the
+        # in-window key/value tiles during prefill instead of the full O(S^2)
+        # score matrix, which is then masked down to the same band. Provably
+        # equivalent to the masked-full path; strictly less prefill compute.
+        self.gemma4_windowed_prefill = kwargs.pop("gemma4_windowed_prefill", True)
+
         # Chunked prefill
         # When chunked prefill is enabled, max_context_length will be
         # used as chunk size. Batch size will be 1 for CTE because it

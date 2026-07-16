@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 import warnings
 from enum import Enum
 from typing import Optional, Tuple, Callable
@@ -67,6 +68,19 @@ from .gqa import GQA, GroupQueryAttention_O, GroupQueryAttention_QKV  # noqa: E4
 
 from nkilib.experimental.transformer.attention_block_tkg import attention_block_tkg
 from nkilib.core.utils.common_types import QuantizationType
+
+try:
+    from .tkg_attn_nki import tkg_attention_kernel_batched
+except Exception:  # keep the baseline decode path import-safe if NKI is unavailable
+    tkg_attention_kernel_batched = None
+
+
+def tkg_attn_nki_enabled() -> bool:
+    """From-scratch fused token-gen attention core (QK^T/mask/softmax/PV only;
+    QKV proj and q/k/v norms stay in model code, preserving HF equivalence).
+    Opt-in via ``NXDI_TKG_ATTN_NKI=1``; read at call time so it can be toggled
+    after import."""
+    return os.environ.get("NXDI_TKG_ATTN_NKI", "") == "1"
 
 
 def import_nki_cte_attention_kernel():
@@ -1459,6 +1473,47 @@ class NeuronAttentionBase(nn.Module):
         attn_output = attn_prior + attn_active
 
         return attn_output
+
+    def _compute_for_token_gen_nki(self, Q, K, V, past_key_value, attention_mask) -> Tensor:
+        """Fused decode attention via the from-scratch NKI kernel (q_len == 1, single KV head).
+
+        Numerically matches compute_for_token_gen: same scores, mask semantics,
+        and softmax over [prior || active], with fp32 accumulators in-kernel.
+        """
+        if tkg_attention_kernel_batched is None:
+            raise RuntimeError(
+                "NXDI_TKG_ATTN_NKI=1 but the from-scratch token-gen NKI kernel "
+                "failed to import; cannot use the fused decode-attention path."
+            )
+        bsz, num_heads, _, head_dim = Q.shape
+        K_prior = past_key_value[0]
+        V_prior = past_key_value[1]
+        # Per-layer KV caches may store K as [B, 1, S, D] or transposed as
+        # [B, 1, D, S], and V likewise; normalize both to [B, 1, S, D] (matching
+        # the native decode path's shape-based layout detection).
+        if K_prior.shape[-1] != head_dim:  # [B, 1, D, S] -> [B, 1, S, D]
+            K_prior = K_prior.transpose(2, 3)
+        if V_prior.shape[-1] != head_dim and V_prior.shape[-2] == head_dim:
+            V_prior = V_prior.transpose(2, 3)
+        s_prior = K_prior.shape[2]
+
+        # pad the attention mask if the KV cache is padded (mirrors the native path)
+        if s_prior > attention_mask.shape[-1] and self.neuron_config.apply_seq_ids_mask:
+            attention_mask = F.pad(
+                attention_mask, (0, s_prior - attention_mask.shape[-1]), "constant", 0
+            )
+
+        mask = attention_mask.expand(-1, num_heads, -1, -1)[:, :, 0, :].to(Q.dtype)  # [B, H, Sp]
+        out = tkg_attention_kernel_batched(
+            Q[:, :, 0, :],                # [B, H, D]
+            K_prior[:, 0, :, :],          # [B, Sp, D]
+            V_prior[:, 0, :, :],
+            K[:, 0, :, :],                # [B, 1, D]
+            V[:, 0, :, :],
+            mask,
+            1.0 / self.softmax_scale,
+        )
+        return out.unsqueeze(2)           # [B, H, 1, D]
 
     def attention_context_encode(self, Q, K, V, q_len, bsz, attention_mask, past_key_value=None, active_mask=None):
         if past_key_value is None:
