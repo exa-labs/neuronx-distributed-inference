@@ -11,7 +11,7 @@ def get_version(version_str):
     if not suffix:
         try:
             suffix = f'{subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("ascii").strip()[0:8]}.dev'
-        except CalledProcessError:
+        except (CalledProcessError, FileNotFoundError):
             suffix = 'dev'
     return f"{major}.{minor}.{patch}+{suffix}"
 
