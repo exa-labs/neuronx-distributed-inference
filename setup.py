@@ -1,7 +1,5 @@
 from setuptools import PEP420PackageFinder, setup
 import os
-import subprocess
-from subprocess import CalledProcessError
 
 
 def get_version(version_str):
@@ -9,10 +7,9 @@ def get_version(version_str):
     patch = os.getenv('VERSION_PATCH', patch)
     suffix = os.getenv('SUFFIX')
     if not suffix:
-        try:
-            suffix = f'{subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("ascii").strip()[0:8]}.dev'
-        except (CalledProcessError, FileNotFoundError):
-            suffix = 'dev'
+        # Deterministic: sandboxed builders (nix/uv) have no git, and the
+        # version must not depend on the build environment.
+        suffix = 'dev'
     return f"{major}.{minor}.{patch}+{suffix}"
 
 
